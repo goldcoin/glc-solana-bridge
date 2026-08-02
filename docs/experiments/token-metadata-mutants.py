@@ -53,8 +53,29 @@ MUTANTS = [
   "        off += 4 + len;",
   "        off += 4 + 32;"),
  ("D8 update authority and mint swapped", "src/solana/rpc.rs",
-  "    let update_authority = Pubkey::try_from(data.get(1..33).ok_or_else(|| need(\"update authority\"))?)",
-  "    let update_authority = Pubkey::try_from(data.get(33..65).ok_or_else(|| need(\"update authority\"))?)"),
+  "data.get(1..33).ok_or_else(|| need(\"update authority\"))?",
+  "data.get(33..65).ok_or_else(|| need(\"update authority\"))?"),
+ ("U1 update writes even when values are identical", "programs/glc-bridge/src/instructions/token_metadata.rs",
+  "            if n == name && s == symbol && u == uri {",
+  "            if false {"),
+ ("U2 update does not require metadata to exist", "programs/glc-bridge/src/instructions/token_metadata.rs",
+  "        info.owner == &TOKEN_METADATA_PROGRAM_ID && !info.data_is_empty(),\n        BridgeError::MetadataNotFound",
+  "        true,\n        BridgeError::MetadataNotFound"),
+ ("U3 update skips the stored-mint check", "programs/glc-bridge/src/instructions/token_metadata.rs",
+  "        require!(\n            stored_mint == mint.as_ref(),\n            BridgeError::InvalidMetadataAccount\n        );",
+  "        let _ = stored_mint;"),
+ ("U4 update hands away the update authority", "programs/glc-bridge/src/instructions/token_metadata.rs",
+  "    data.push(0); // update_authority: None — unchanged",
+  "    data.push(1); // update_authority: Some"),
+ ("U5 NUL padding not trimmed when comparing", "programs/glc-bridge/src/instructions/token_metadata.rs",
+  "                .trim_end_matches('\\0')\n                .to_string(),",
+  "                .to_string(),"),
+ ("U6 relayer update omits a string length prefix", "src/solana/instruction.rs",
+  "    for s in [name, symbol, uri] {\n        data.extend_from_slice(&(s.len() as u32).to_le_bytes());\n        data.extend_from_slice(s.as_bytes());\n    }",
+  "    for s in [name, symbol, uri] {\n        data.extend_from_slice(s.as_bytes());\n    }"),
+ ("U7 relayer update marks metadata read-only", "src/solana/instruction.rs",
+  "            AccountMeta::new(token_metadata_pda(wrapped_mint).0, false),\n            AccountMeta::new_readonly(TOKEN_METADATA_PROGRAM_ID, false),\n        ],\n        data,\n    }\n}\n\n#[cfg(test)]",
+  "            AccountMeta::new_readonly(token_metadata_pda(wrapped_mint).0, false),\n            AccountMeta::new_readonly(TOKEN_METADATA_PROGRAM_ID, false),\n        ],\n        data,\n    }\n}\n\n#[cfg(test)]"),
 ]
 
 def run(cmd, cwd=ROOT):
@@ -62,18 +83,32 @@ def run(cmd, cwd=ROOT):
 
 survived, killed, broken = [], [], []
 for name, path, old, new in MUTANTS:
-    full = os.path.join(ROOT, path)
+    full = os.path.join(
+        "/home/reaper/glc-solana-bridge" if path.startswith("programs/") else ROOT, path
+    )
     src = open(full).read()
     if old not in src:
         broken.append((name, "pattern not found"))
         continue
     shutil.copy(full, full + ".bak")
     open(full, "w").write(src.replace(old, new, 1))
+    cwd = "/home/reaper/glc-solana-bridge" if path.startswith("programs/") else ROOT
+    if path.startswith("programs/"):
+        run("cargo build-sbf --manifest-path programs/glc-bridge/Cargo.toml",
+            cwd="/home/reaper/glc-solana-bridge")
     a = run("cargo test --lib -- solana::")
     b = run("cargo test -p glc-bridge --test admin_governance_encoding --test token_metadata",
             cwd="/home/reaper/glc-solana-bridge")
+    _ = cwd
     shutil.move(full + ".bak", full)
     os.utime(full, None)  # restore bumps mtime; otherwise cargo keeps the mutant build
+    if path.startswith("programs/"):
+        # Rebuild the SBF artifact from the RESTORED source. litesvm loads the
+        # prebuilt .so, so skipping this leaves the working tree's binary
+        # holding the last mutant's code — the suite then passes during the
+        # run and fails for everyone afterwards.
+        run("cargo build-sbf --manifest-path programs/glc-bridge/Cargo.toml",
+            cwd="/home/reaper/glc-solana-bridge")
 
     # Exit CODES, not a count of "test result: ok" lines.
     #

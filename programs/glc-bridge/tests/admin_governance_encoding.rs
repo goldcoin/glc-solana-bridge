@@ -574,3 +574,57 @@ fn the_metadata_name_and_symbol_are_program_constants() {
         "wGLC"
     );
 }
+
+#[test]
+fn update_token_metadata_encodes_three_borsh_strings_and_writes_only_metadata() {
+    use anchor_lang::ToAccountMetas;
+
+    let admin = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let metaplex: Pubkey =
+        anchor_lang::solana_program::pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+    let metadata =
+        Pubkey::find_program_address(&[b"metadata", metaplex.as_ref(), mint.as_ref()], &metaplex).0;
+
+    let ix = anchor_lang::solana_program::instruction::Instruction {
+        program_id: glc_bridge::ID,
+        accounts: glc_bridge::accounts::UpdateTokenMetadata {
+            admin,
+            bridge_config: config_pda(),
+            mint_authority: mint_authority_pda(),
+            metadata,
+            token_metadata_program: metaplex,
+        }
+        .to_account_metas(None),
+        data: glc_bridge::instruction::UpdateTokenMetadata {
+            name: "Wrapped Goldcoin".into(),
+            symbol: "wGLC".into(),
+            uri: "https://x/a.json".into(),
+        }
+        .data(),
+    };
+
+    assert_eq!(&ix.data[..8], &discriminator("update_token_metadata"));
+    let mut off = 8;
+    for expected in ["Wrapped Goldcoin", "wGLC", "https://x/a.json"] {
+        let len = u32::from_le_bytes(ix.data[off..off + 4].try_into().unwrap()) as usize;
+        assert_eq!(len, expected.len());
+        assert_eq!(&ix.data[off + 4..off + 4 + len], expected.as_bytes());
+        off += 4 + len;
+    }
+    assert_eq!(ix.data.len(), off);
+
+    // The mint is absent, and only the metadata account is writable — the
+    // structural reason an update cannot disturb the token itself.
+    assert!(!ix.accounts.iter().any(|m| m.pubkey == mint));
+    assert_eq!(
+        shape(&ix),
+        vec![
+            (admin, true, false),
+            (config_pda(), false, false),
+            (mint_authority_pda(), false, false),
+            (metadata, false, true),
+            (metaplex, false, false),
+        ]
+    );
+}

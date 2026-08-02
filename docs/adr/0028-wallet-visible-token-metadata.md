@@ -136,9 +136,55 @@ Running `token-metadata` before those files exist writes a URI that wallets
 cannot resolve, permanently absent a program upgrade. The runbook states the
 ordering; this records why it is load-bearing rather than tidy.
 
+## 9. Updating, added before launch
+
+`create_token_metadata` alone left the URI effectively write-once (§7.1),
+because idempotence is by *existence* rather than contents. Moving the
+hosting would then have required a metadata-update instruction — i.e. a
+program upgrade, i.e. the single-key upgrade authority (custody #5).
+
+`update_token_metadata` closes that, while nothing is deployed and adding
+instructions is free.
+
+| property | how |
+|---|---|
+| admin-only | same `bridge_config.admin` constraint as creation |
+| touches only metadata | the instruction **takes no mint account**, so it structurally cannot alter the mint, its decimals or its authorities |
+| belongs to our mint | the PDA is re-derived **and** the mint recorded inside the metadata account is compared — defence in depth against a future Metaplex seed change |
+| must already exist | absent metadata is `MetadataNotFound`, a different mistake from a failed create |
+| idempotent | identical name, symbol and URI write nothing and make **no CPI** |
+| authority preserved | `update_authority` and `is_mutable` are sent as Borsh `None`, so neither moves |
+
+Name and symbol became arguments here while remaining program constants at
+creation. That asymmetry is deliberate: creation must be right by
+construction and unable to be typo'd, whereas a rename is an explicit
+decision someone is making on purpose.
+
+A consequence worth stating: `glc-admin token-metadata`'s verification now
+reports a name/symbol difference as a **notice** rather than a fault, since
+an intentional rename must not look like an alarm. The mint and the update
+authority remain hard failures — those are security properties, not display.
+
+### 9.1 Two vacuous tests, found by mutation testing
+
+Four mutants survived the first run of the update suite, and two shared a
+root cause worth recording: **comparing account bytes cannot detect a
+redundant write**, because writing identical values produces identical
+bytes. The idempotence test passed with the idempotence check removed.
+
+Compute units looked like the fix but litesvm reports a flat figure. The
+observable that works is the **transaction logs**: a CPI leaves a Metaplex
+`invoke [2]` line and an early return does not.
+
+The other two were a test asserting only `is_err()` — which passed when our
+check was removed because Metaplex failed downstream for its own reasons,
+so it now asserts the specific error — and a defence-in-depth check
+unreachable by construction, now exercised by fabricating a metadata account
+with the correct PDA but a wrong stored mint.
+
 ## 8. What this ADR does not decide
 
 - Who publishes the metadata JSON and image, or when.
-- Whether to add a metadata-update instruction later (none exists today).
+- Whether to ever make the metadata immutable (`is_mutable` stays true).
 - Whether to make the metadata immutable later.
 - Anything about the token's listing, logo artwork, or exchange integration.

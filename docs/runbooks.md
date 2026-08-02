@@ -601,16 +601,53 @@ any time, not only at launch.
 Decimals are not set here and cannot be: Metaplex metadata carries no
 decimals field. Wallets read them from the mint, which already says 8.
 
-### 14.2 Why the URI is effectively write-once
+### 14.2 Changing the name, symbol or URI later
+
+`glc-admin update-token-metadata` changes what wallets display, **without a
+program upgrade**. Admin-gated, like creation.
+
+```
+# move the hosting URL, leaving the name and symbol alone
+glc-admin update-token-metadata \
+  --uri "https://new-host.example/wglc.json" --note "OPS-n: hosting moved"
+
+# rename (rarely wanted; wallets and listings cache aggressively)
+glc-admin update-token-metadata \
+  --name "Wrapped Goldcoin" --symbol "wGLC" --note "OPS-n: ..."
+```
+
+**Omitted values keep whatever is on chain.** Moving only the URL cannot
+rename the token by accident.
+
+**Idempotent.** If the values already match, the program writes nothing and
+makes no CPI — so re-running is how you confirm a change landed, not a
+second write. The command reads the account back and verifies either way.
+
+**It touches only the metadata account.** The instruction takes no mint
+account at all, so the mint address, its decimals, its mint authority and
+its freeze authority cannot be affected. The metadata's own update authority
+stays with the program's mint-authority PDA — an update never hands that to
+a keypair.
+
+**Order matters, as at creation:** publish the new JSON first, confirm it
+returns 200, then update. Wallets and explorers cache metadata, so the change
+may take hours to appear; that is not a failure.
+
+**If the metadata does not exist yet**, this refuses and tells you to run
+`glc-admin token-metadata` first — updating something never created is a
+different mistake from a failed create.
+
+### 14.3 Why the URI was once write-once
 
 `token-metadata` is idempotent by "does metadata exist", **not** by "does it
 match what I passed". A second run with a different `--uri` leaves the
 existing account alone — deliberately, so re-running to verify can never
 silently rewrite what wallets are already displaying.
 
-The consequence is that the URI is set once, at creation. Changing it later
-requires a metadata-update instruction, which does not exist. Get the hosting
-right before the first run.
+Changing values after creation is therefore a separate, explicit act:
+`update-token-metadata` (§14.2). That instruction exists precisely so the
+hosting URL can move without a program upgrade, which would otherwise mean
+exercising the single-key upgrade authority (custody #5).
 
 **4. Verify what actually landed.**
 

@@ -78,6 +78,9 @@ BOOTSTRAP (once, at launch -- see docs/launch-checklist.md)
   create-wrapped-mint   --mint-keypair PATH --note TEXT
   token-metadata        [--uri URL] --note TEXT     (create if absent, then verify)
                         default uri: https://goldcoinproject.org/assets/wglc.json
+  update-token-metadata [--name TEXT] [--symbol TEXT] [--uri URL] --note TEXT
+                        changes what wallets display; omitted values keep
+                        their current on-chain value
   show-config
 
 ADMIN HANDOVER (custody #5)
@@ -224,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
         "initialize" => initialize(&args).await,
         "create-wrapped-mint" => create_wrapped_mint(&args).await,
         "token-metadata" => token_metadata(&args).await,
+        "update-token-metadata" => update_token_metadata(&args).await,
         "transfer-admin" => transfer_admin(&args).await,
         "accept-admin" => accept_admin(&args).await,
         "submit-rotation" => submit_rotation(&args).await,
@@ -1548,6 +1552,112 @@ async fn token_metadata(args: &[String]) -> anyhow::Result<()> {
     println!(
         "\nOK — wallets will display {} ({}), 8 decimals from the mint.",
         m.name, m.symbol
+    );
+    Ok(())
+}
+
+/// `update-token-metadata` — changes what wallets display (ADR-0028 §9).
+///
+/// Omitted values keep whatever is on chain, so moving only the hosting URL
+/// does not require restating the name and symbol — and cannot change them
+/// by accident.
+///
+/// Idempotent: the program writes nothing when the values already match, so
+/// re-running is how an operator confirms a change landed.
+async fn update_token_metadata(args: &[String]) -> anyhow::Result<()> {
+    let note = require_note(args);
+    let chain = chain_from_env()?;
+    let admin = keypair_at("GLC_ADMIN_KEYPAIR_PATH")?;
+
+    let cfg = bridge_config(&chain).await?;
+    if !cfg.mint_is_configured() {
+        anyhow::bail!("no wrapped mint exists yet — run `glc-admin create-wrapped-mint` first");
+    }
+    let mint = cfg.wrapped_mint;
+    let (metadata_pda, _) = ix::token_metadata_pda(&mint);
+
+    let account = chain.rpc.get_account(&metadata_pda).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "there is no token metadata for mint {mint} yet.\n\
+             Run `glc-admin token-metadata` to create it before updating it."
+        )
+    })?;
+    let current = decode_token_metadata(&account.data)?;
+
+    // Omitted values keep their current on-chain value, so moving only the
+    // URL cannot rename the token by accident.
+    let name = arg(args, "--name").unwrap_or_else(|| current.name.clone());
+    let symbol = arg(args, "--symbol").unwrap_or_else(|| current.symbol.clone());
+    let uri = arg(args, "--uri").unwrap_or_else(|| current.uri.clone());
+
+    if name == current.name && symbol == current.symbol && uri == current.uri {
+        println!(
+            "token metadata already matches — nothing to change.\n  name:   {}\n  symbol: {}\n  uri:    {}",
+            current.name,
+            current.symbol,
+            if current.uri.is_empty() {
+                "(none)"
+            } else {
+                &current.uri
+            }
+        );
+        return Ok(());
+    }
+
+    println!(
+        "updating token metadata for mint {mint}\n  name:   {:?} -> {:?}\n  symbol: {:?} -> {:?}\n  uri:    {:?} -> {:?}",
+        current.name, name, current.symbol, symbol, current.uri, uri
+    );
+
+    let instruction = ix::update_token_metadata_instruction(
+        &chain.program_id,
+        &admin.pubkey(),
+        &mint,
+        &name,
+        &symbol,
+        &uri,
+    );
+    submit(
+        &chain,
+        &[instruction],
+        &admin,
+        "update-token-metadata",
+        &note,
+    )
+    .await?;
+
+    // Read back rather than trusting the signature.
+    let account = chain
+        .rpc
+        .get_account(&metadata_pda)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("metadata account {metadata_pda} vanished"))?;
+    let after = decode_token_metadata(&account.data)?;
+    if after.name != name || after.symbol != symbol || after.uri != uri {
+        anyhow::bail!(
+            "the update was submitted but the on-chain values do not match:\n  name {:?}, symbol {:?}, uri {:?}",
+            after.name,
+            after.symbol,
+            after.uri
+        );
+    }
+    if after.mint != mint {
+        anyhow::bail!("the metadata now names a different mint — report this immediately");
+    }
+
+    println!(
+        "\nverified on chain — wallets will display {} ({}).\n  uri: {}",
+        after.name,
+        after.symbol,
+        if after.uri.is_empty() {
+            "(none)"
+        } else {
+            &after.uri
+        }
+    );
+    println!(
+        "\nWallets and explorers cache metadata; the change may take time to appear.\n\
+         The mint, its decimals and its authorities are unchanged."
     );
     Ok(())
 }

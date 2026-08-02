@@ -107,4 +107,10 @@ pub enum BridgeError {
     UriTooLong,
     #[msg("the metadata account is not the PDA Metaplex derives for this mint")]
     InvalidMetadataAccount,
+    #[msg("token metadata name must be 1..=32 bytes")]
+    NameTooLong,
+    #[msg("token metadata symbol must be 1..=10 bytes")]
+    SymbolTooLong,
+    #[msg("no token metadata exists for this mint yet — create it first")]
+    MetadataNotFound,
 }

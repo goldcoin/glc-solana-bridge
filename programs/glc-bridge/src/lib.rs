@@ -158,6 +158,18 @@ pub mod glc_bridge {
         instructions::create_token_metadata(ctx, uri)
     }
 
+    /// Changes the wrapped mint's displayed name, symbol and URI
+    /// (ADR-0028 §9). Admin-only, idempotent, and touches nothing but the
+    /// Metaplex metadata account.
+    pub fn update_token_metadata(
+        ctx: Context<UpdateTokenMetadata>,
+        name: String,
+        symbol: String,
+        uri: String,
+    ) -> Result<()> {
+        instructions::update_token_metadata(ctx, name, symbol, uri)
+    }
+
     /// Records, under an M-of-N federation proof, that a withdrawal was paid
     /// on Goldcoin (Phase 7f, ADR-0018). Terminal and irreversible.
     pub fn complete_withdrawal(

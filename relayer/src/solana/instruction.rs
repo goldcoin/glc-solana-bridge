@@ -556,6 +556,38 @@ pub fn create_token_metadata_instruction(
     }
 }
 
+/// `update_token_metadata` — changes the displayed name, symbol and URI.
+///
+/// Exists so the hosting URL can move **without a program upgrade**, which
+/// would otherwise mean exercising the single-key upgrade authority
+/// (custody #5). Takes no mint account, so it cannot alter the mint.
+pub fn update_token_metadata_instruction(
+    program_id: &Pubkey,
+    admin: &Pubkey,
+    wrapped_mint: &Pubkey,
+    name: &str,
+    symbol: &str,
+    uri: &str,
+) -> Instruction {
+    let mut data = Vec::with_capacity(8 + 12 + name.len() + symbol.len() + uri.len());
+    data.extend_from_slice(&anchor_discriminator("update_token_metadata"));
+    for s in [name, symbol, uri] {
+        data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        data.extend_from_slice(s.as_bytes());
+    }
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(*admin, true),
+            AccountMeta::new_readonly(bridge_config_pda(program_id).0, false),
+            AccountMeta::new_readonly(mint_authority_pda(program_id).0, false),
+            AccountMeta::new(token_metadata_pda(wrapped_mint).0, false),
+            AccountMeta::new_readonly(TOKEN_METADATA_PROGRAM_ID, false),
+        ],
+        data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,5 +1127,96 @@ mod tests {
         );
         assert_eq!(WRAPPED_GLC_NAME, "Wrapped Goldcoin");
         assert_eq!(WRAPPED_GLC_SYMBOL, "wGLC");
+    }
+
+    #[test]
+    fn update_token_metadata_encodes_three_borsh_strings_in_order() {
+        let program_id = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ix = update_token_metadata_instruction(
+            &program_id,
+            &admin,
+            &mint,
+            "Wrapped Goldcoin",
+            "wGLC",
+            "https://x/a.json",
+        );
+
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator("update_token_metadata")
+        );
+        let mut off = 8;
+        for expected in ["Wrapped Goldcoin", "wGLC", "https://x/a.json"] {
+            let len = u32::from_le_bytes(ix.data[off..off + 4].try_into().unwrap()) as usize;
+            assert_eq!(len, expected.len());
+            assert_eq!(&ix.data[off + 4..off + 4 + len], expected.as_bytes());
+            off += 4 + len;
+        }
+        assert_eq!(ix.data.len(), off, "no trailing bytes");
+    }
+
+    #[test]
+    fn an_update_takes_no_mint_account_at_all() {
+        // The structural guarantee behind "the mint is unchanged": the
+        // instruction has no mint to alter.
+        let program_id = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ix = update_token_metadata_instruction(
+            &program_id,
+            &Pubkey::new_unique(),
+            &mint,
+            "n",
+            "s",
+            "u",
+        );
+        assert!(
+            !ix.accounts.iter().any(|m| m.pubkey == mint),
+            "the mint must not appear among the accounts"
+        );
+        assert_eq!(
+            shape(&ix)
+                .iter()
+                .filter(|(_, _, writable)| *writable)
+                .count(),
+            1,
+            "only the metadata account is writable"
+        );
+    }
+
+    #[test]
+    fn an_update_writes_only_the_metadata_account() {
+        let program_id = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ix = update_token_metadata_instruction(&program_id, &admin, &mint, "n", "s", "u");
+        assert_eq!(
+            shape(&ix),
+            vec![
+                (admin, true, false),
+                (bridge_config_pda(&program_id).0, false, false),
+                (mint_authority_pda(&program_id).0, false, false),
+                (token_metadata_pda(&mint).0, false, true),
+                (TOKEN_METADATA_PROGRAM_ID, false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_and_update_target_the_same_metadata_account() {
+        // If these diverged, an update would silently edit an account no
+        // wallet is reading.
+        let program_id = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let c = create_token_metadata_instruction(&program_id, &admin, &mint, "u");
+        let u = update_token_metadata_instruction(&program_id, &admin, &mint, "n", "s", "u");
+        let c_meta = c
+            .accounts
+            .iter()
+            .find(|m| m.is_writable && m.pubkey != admin);
+        let u_meta = u.accounts.iter().find(|m| m.is_writable);
+        assert_eq!(c_meta.unwrap().pubkey, u_meta.unwrap().pubkey);
     }
 }
