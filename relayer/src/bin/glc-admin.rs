@@ -47,8 +47,8 @@ use glc_relayer::p2p::identity::{parse_peers, TlsMaterial, TlsPaths};
 use glc_relayer::signer::aggregate::build_ed25519_instruction;
 use glc_relayer::solana::instruction as ix;
 use glc_relayer::solana::rpc::{
-    decode_bridge_config, decode_pending_action, decode_validator_set, BridgeConfigSnapshot,
-    PendingActionSnapshot, RealSolanaRpc, SolanaRpc,
+    decode_bridge_config, decode_pending_action, decode_token_metadata, decode_validator_set,
+    BridgeConfigSnapshot, PendingActionSnapshot, RealSolanaRpc, SolanaRpc,
 };
 use glc_relayer::withdrawal::adapter::RealPayoutRpc;
 use glc_relayer::withdrawal::executor::PayoutRpc;
@@ -76,6 +76,7 @@ BOOTSTRAP (once, at launch -- see docs/launch-checklist.md)
   initialize            --validators A,B,C --threshold M --timelock-secs N
                         --max-supply ATOMIC --min-deposit N --min-withdrawal N --note TEXT
   create-wrapped-mint   --mint-keypair PATH --note TEXT
+  token-metadata        [--uri URL] --note TEXT     (create if absent, then verify)
   show-config
 
 ADMIN HANDOVER (custody #5)
@@ -221,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
         "show-config" => show_config(&args).await,
         "initialize" => initialize(&args).await,
         "create-wrapped-mint" => create_wrapped_mint(&args).await,
+        "token-metadata" => token_metadata(&args).await,
         "transfer-admin" => transfer_admin(&args).await,
         "accept-admin" => accept_admin(&args).await,
         "submit-rotation" => submit_rotation(&args).await,
@@ -1446,4 +1448,102 @@ async fn accept_admin(args: &[String]) -> anyhow::Result<()> {
     println!("ACCEPTING the admin role as {}", new_admin.pubkey());
     let instruction = ix::accept_admin_instruction(&chain.program_id, &new_admin.pubkey());
     submit(&chain, &[instruction], &new_admin, "accept-admin", &note).await
+}
+
+/// `token-metadata` — makes the wrapped mint show up in wallets as
+/// "Wrapped Goldcoin (wGLC)", and confirms it did (ADR-0028).
+///
+/// **Create-or-verify, in one command.** If the metadata does not exist it
+/// is created; if it does, nothing is written. Either way the account is
+/// read back and checked, so running this is how an operator answers "is the
+/// token named correctly?" without having to know whether it was done
+/// before.
+///
+/// Decimals are deliberately absent: Metaplex metadata carries none, and
+/// wallets read them from the mint, which already says 8. There is no second
+/// copy that could disagree.
+async fn token_metadata(args: &[String]) -> anyhow::Result<()> {
+    let note = require_note(args);
+    let uri = arg(args, "--uri").unwrap_or_default();
+    let chain = chain_from_env()?;
+    let admin = keypair_at("GLC_ADMIN_KEYPAIR_PATH")?;
+
+    let cfg = bridge_config(&chain).await?;
+    if !cfg.mint_is_configured() {
+        anyhow::bail!(
+            "no wrapped mint exists yet — run `glc-admin create-wrapped-mint` first"
+        );
+    }
+    let mint = cfg.wrapped_mint;
+    let (metadata_pda, _) = ix::token_metadata_pda(&mint);
+
+    let existing = chain.rpc.get_account(&metadata_pda).await?;
+    if existing.as_ref().is_some_and(|a| !a.data.is_empty()) {
+        println!("metadata already exists at {metadata_pda} — nothing to create");
+    } else {
+        println!(
+            "creating token metadata for mint {mint}\n  name:   {}\n  symbol: {}\n  uri:    {}",
+            ix::WRAPPED_GLC_NAME,
+            ix::WRAPPED_GLC_SYMBOL,
+            if uri.is_empty() { "(none)" } else { &uri }
+        );
+        let instruction = ix::create_token_metadata_instruction(
+            &chain.program_id,
+            &admin.pubkey(),
+            &mint,
+            &uri,
+        );
+        submit(&chain, &[instruction], &admin, "token-metadata", &note).await?;
+    }
+
+    // Verify by reading it back, whichever branch we took. A command that
+    // reports success without looking is how "it was done months ago"
+    // becomes an assumption nobody checked.
+    let account = chain
+        .rpc
+        .get_account(&metadata_pda)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("metadata account {metadata_pda} does not exist"))?;
+    let m = decode_token_metadata(&account.data)?;
+
+    println!(
+        "\nverified on chain ({metadata_pda})\n  name:   {}\n  symbol: {}\n  uri:    {}\n  \
+         mint:   {}\n  update authority: {}",
+        m.name,
+        m.symbol,
+        if m.uri.is_empty() { "(none)" } else { &m.uri },
+        m.mint,
+        m.update_authority
+    );
+
+    let (mint_authority, _) = ix::mint_authority_pda(&chain.program_id);
+    let mut wrong = Vec::new();
+    if m.name != ix::WRAPPED_GLC_NAME {
+        wrong.push(format!("name is {:?}, expected {:?}", m.name, ix::WRAPPED_GLC_NAME));
+    }
+    if m.symbol != ix::WRAPPED_GLC_SYMBOL {
+        wrong.push(format!(
+            "symbol is {:?}, expected {:?}",
+            m.symbol,
+            ix::WRAPPED_GLC_SYMBOL
+        ));
+    }
+    if m.mint != mint {
+        wrong.push(format!("metadata names mint {}, not {mint}", m.mint));
+    }
+    if m.update_authority != mint_authority {
+        wrong.push(format!(
+            "update authority is {}, not the program's mint-authority PDA {mint_authority}",
+            m.update_authority
+        ));
+    }
+    if !wrong.is_empty() {
+        anyhow::bail!(
+            "the on-chain metadata is NOT what this bridge expects:\n  - {}",
+            wrong.join("\n  - ")
+        );
+    }
+
+    println!("\nOK — wallets will display {} ({}), 8 decimals from the mint.", m.name, m.symbol);
+    Ok(())
 }

@@ -483,6 +483,66 @@ pub fn accept_admin_instruction(program_id: &Pubkey, new_admin: &Pubkey) -> Inst
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wallet-visible token metadata (ADR-0028)
+// ---------------------------------------------------------------------------
+
+/// The Metaplex Token Metadata program, pinned to the same constant the
+/// on-chain program address-checks.
+pub const TOKEN_METADATA_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+
+/// What wallets will display. Constants on both sides so the two cannot
+/// drift; the on-chain program is what actually writes them.
+pub const WRAPPED_GLC_NAME: &str = "Wrapped Goldcoin";
+pub const WRAPPED_GLC_SYMBOL: &str = "wGLC";
+
+/// Metaplex's metadata PDA for a mint: `["metadata", program, mint]`,
+/// derived under the **Metaplex** program, not ours.
+pub fn token_metadata_pda(mint: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            b"metadata",
+            TOKEN_METADATA_PROGRAM_ID.as_ref(),
+            mint.as_ref(),
+        ],
+        &TOKEN_METADATA_PROGRAM_ID,
+    )
+}
+
+/// `create_token_metadata` — creates the wrapped mint's Metaplex metadata.
+///
+/// Idempotent on chain: the program returns `Ok` without writing if the
+/// metadata account already exists, so re-running is how an operator
+/// verifies rather than gambles.
+pub fn create_token_metadata_instruction(
+    program_id: &Pubkey,
+    admin: &Pubkey,
+    wrapped_mint: &Pubkey,
+    uri: &str,
+) -> Instruction {
+    let mut data = Vec::with_capacity(8 + 4 + uri.len());
+    data.extend_from_slice(&anchor_discriminator("create_token_metadata"));
+    // Borsh string: u32 length prefix, then bytes.
+    data.extend_from_slice(&(uri.len() as u32).to_le_bytes());
+    data.extend_from_slice(uri.as_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*admin, true),
+            AccountMeta::new_readonly(bridge_config_pda(program_id).0, false),
+            AccountMeta::new_readonly(mint_authority_pda(program_id).0, false),
+            AccountMeta::new_readonly(*wrapped_mint, false),
+            AccountMeta::new(token_metadata_pda(wrapped_mint).0, false),
+            AccountMeta::new_readonly(TOKEN_METADATA_PROGRAM_ID, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+        ],
+        data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,5 +971,89 @@ mod tests {
         )
         .0;
         assert_eq!(program_data_address(&program_id), expected);
+    }
+
+    // --- token metadata (ADR-0028) -----------------------------------------
+
+    #[test]
+    fn create_token_metadata_encodes_a_borsh_string() {
+        let program_id = Pubkey::new_unique();
+        let admin = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ix = create_token_metadata_instruction(&program_id, &admin, &mint, "abc");
+
+        assert_eq!(
+            &ix.data[..8],
+            &anchor_discriminator("create_token_metadata")
+        );
+        assert_eq!(&ix.data[8..12], &3u32.to_le_bytes());
+        assert_eq!(&ix.data[12..15], b"abc");
+        assert_eq!(ix.data.len(), 15);
+
+        assert_eq!(
+            shape(&ix),
+            vec![
+                (admin, true, true),
+                (bridge_config_pda(&program_id).0, false, false),
+                (mint_authority_pda(&program_id).0, false, false),
+                (mint, false, false),
+                (token_metadata_pda(&mint).0, false, true),
+                (TOKEN_METADATA_PROGRAM_ID, false, false),
+                (system_program::id(), false, false),
+                (sysvar::rent::ID, false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_uri_encodes_as_a_zero_length_string() {
+        // The default: metadata with a name and symbol but no hosted JSON.
+        let program_id = Pubkey::new_unique();
+        let ix = create_token_metadata_instruction(
+            &program_id,
+            &Pubkey::new_unique(),
+            &Pubkey::new_unique(),
+            "",
+        );
+        assert_eq!(&ix.data[8..12], &0u32.to_le_bytes());
+        assert_eq!(ix.data.len(), 12);
+    }
+
+    #[test]
+    fn the_metadata_pda_is_derived_under_metaplex_not_under_us() {
+        // The seeds belong to Metaplex; deriving under our program id would
+        // produce an address Metaplex rejects.
+        let mint = Pubkey::new_unique();
+        let ours = Pubkey::new_unique();
+        let expected = Pubkey::find_program_address(
+            &[
+                b"metadata",
+                TOKEN_METADATA_PROGRAM_ID.as_ref(),
+                mint.as_ref(),
+            ],
+            &TOKEN_METADATA_PROGRAM_ID,
+        )
+        .0;
+        assert_eq!(token_metadata_pda(&mint).0, expected);
+        assert_ne!(
+            token_metadata_pda(&mint).0,
+            Pubkey::find_program_address(
+                &[b"metadata", TOKEN_METADATA_PROGRAM_ID.as_ref(), mint.as_ref()],
+                &ours
+            )
+            .0
+        );
+    }
+
+    #[test]
+    fn the_metaplex_id_and_display_strings_are_pinned() {
+        // These are what wallets show and what the on-chain program writes;
+        // both sides hold the same constants so they cannot drift.
+        assert_eq!(
+            TOKEN_METADATA_PROGRAM_ID.to_string(),
+            "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+        );
+        assert_eq!(WRAPPED_GLC_NAME, "Wrapped Goldcoin");
+        assert_eq!(WRAPPED_GLC_SYMBOL, "wGLC");
     }
 }

@@ -365,7 +365,7 @@ variables, and additionally:
 
 | variable | required for | meaning |
 |---|---|---|
-| `GLC_ADMIN_KEYPAIR_PATH` | `pause`, `unpause`, `lower-tvl-cap` | the **interim single admin key** (custody #7, OPEN — see runbook §9) |
+| `GLC_ADMIN_KEYPAIR_PATH` | `pause`, `unpause`, `lower-tvl-cap`, `initialize`, `create-wrapped-mint`, `token-metadata` | the **interim single admin key** (custody #7, OPEN — see runbook §9) |
 | `GLC_SOLANA_SUBMITTER_KEYPAIR_PATH` | every governance submission | pays fees only |
 | `GLC_RPC_URL`, `GLC_RPC_USER`, `GLC_RPC_PASSWORD` | `sweep-execute` | the node that builds and broadcasts the sweep |
 | `GLC_DB_PATH` | recovery and sweep commands | this operator's own database |

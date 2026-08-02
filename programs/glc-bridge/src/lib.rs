@@ -151,6 +151,13 @@ pub mod glc_bridge {
         instructions::execute_wrapped_supply_cap_raise(ctx)
     }
 
+    /// Creates wallet-visible Metaplex metadata for the wrapped mint
+    /// (ADR-0028). Admin-only, idempotent, and additive: the mint address,
+    /// its authority and its decimals are untouched.
+    pub fn create_token_metadata(ctx: Context<CreateTokenMetadata>, uri: String) -> Result<()> {
+        instructions::create_token_metadata(ctx, uri)
+    }
+
     /// Records, under an M-of-N federation proof, that a withdrawal was paid
     /// on Goldcoin (Phase 7f, ADR-0018). Terminal and irreversible.
     pub fn complete_withdrawal(

@@ -569,7 +569,26 @@ exactly one transaction. Afterwards the mint authority is a program PDA and
 freeze authority is `None` (custody #6) — the keypair confers nothing and is
 one more thing to lose.
 
-**3. Verify what actually landed.**
+**3. Give the token its wallet-visible name.**
+
+```
+glc-admin token-metadata --uri "https://<your-host>/wglc.json" --note "launch: OPS-1"
+```
+
+Creates Metaplex metadata so wallets show **Wrapped Goldcoin (wGLC)** instead
+of a bare mint address. `--uri` is optional and points at a hosted JSON file
+carrying the logo; omit it for name and symbol only.
+
+**Idempotent, and it verifies.** If the metadata already exists nothing is
+written; either way the account is read back and checked against what this
+bridge expects. Re-running is how you answer "is the token named correctly?"
+without needing to know whether it was done before — and it is safe to run at
+any time, not only at launch.
+
+Decimals are not set here and cannot be: Metaplex metadata carries no
+decimals field. Wallets read them from the mint, which already says 8.
+
+**4. Verify what actually landed.**
 
 ```
 glc-admin show-config
@@ -580,7 +599,7 @@ supply ceiling and deposit/withdrawal floors are what you intended. Reading
 them back is not a formality: nothing else will tell you a digit was
 transposed.
 
-**4. Pause before any funds can move** (§9), then bring operators up.
+**5. Pause before any funds can move** (§9), then bring operators up.
 
 ### 14.1 Admin handover (custody #5)
 

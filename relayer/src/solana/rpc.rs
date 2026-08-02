@@ -85,6 +85,61 @@ pub fn decode_validator_set(data: &[u8]) -> Result<ValidatorSetSnapshot, SolanaR
     })
 }
 
+/// A mint's Metaplex metadata, as wallets read it (ADR-0028).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenMetadataSnapshot {
+    pub update_authority: Pubkey,
+    pub mint: Pubkey,
+    pub name: String,
+    pub symbol: String,
+    pub uri: String,
+}
+
+/// Decodes the leading fields of a Metaplex `Metadata` account.
+///
+/// Layout: `key(1) update_authority(32) mint(32)`, then `name`, `symbol` and
+/// `uri` as Borsh strings. Only these are read — the fields after them
+/// (fees, creators, collection, editions) are not part of what a wallet
+/// displays for a fungible token and are not this bridge's business.
+///
+/// Metaplex **pads** each string to a fixed capacity with NUL bytes, so a
+/// name that reads `"Wrapped Goldcoin\0\0\0..."` on chain is the same name.
+/// Trimming is required, not cosmetic: comparing untrimmed would report a
+/// correct token as misconfigured.
+pub fn decode_token_metadata(data: &[u8]) -> Result<TokenMetadataSnapshot, SolanaRpcError> {
+    let need = |what: &str| SolanaRpcError::Malformed(format!("token metadata: missing {what}"));
+    let update_authority = Pubkey::try_from(data.get(1..33).ok_or_else(|| need("update authority"))?)
+        .map_err(|_| need("update authority"))?;
+    let mint =
+        Pubkey::try_from(data.get(33..65).ok_or_else(|| need("mint"))?).map_err(|_| need("mint"))?;
+
+    let mut off = 65usize;
+    let mut string = |what: &'static str| -> Result<String, SolanaRpcError> {
+        let len = u32::from_le_bytes(
+            data.get(off..off + 4)
+                .ok_or_else(|| need(what))?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let raw = data.get(off + 4..off + 4 + len).ok_or_else(|| need(what))?;
+        off += 4 + len;
+        Ok(String::from_utf8_lossy(raw)
+            .trim_end_matches('\0')
+            .to_string())
+    };
+    let name = string("name")?;
+    let symbol = string("symbol")?;
+    let uri = string("uri")?;
+
+    Ok(TokenMetadataSnapshot {
+        update_authority,
+        mint,
+        name,
+        symbol,
+        uri,
+    })
+}
+
 /// The bridge's configuration, decoded from `BridgeConfig` (ADR-0008,
 /// extended by ADR-0009 and ADR-0014 §11).
 ///
@@ -423,6 +478,60 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Metaplex metadata account body, with the NUL padding the real
+    /// program writes.
+    fn metadata_bytes(name: &str, symbol: &str, uri: &str) -> Vec<u8> {
+        let mut d = vec![4u8]; // key: MetadataV1
+        d.extend_from_slice(Pubkey::new_from_array([0x11; 32]).as_ref());
+        d.extend_from_slice(Pubkey::new_from_array([0x22; 32]).as_ref());
+        for (s, cap) in [(name, 32usize), (symbol, 10), (uri, 200)] {
+            let mut padded = s.as_bytes().to_vec();
+            padded.resize(cap, 0);
+            d.extend_from_slice(&(cap as u32).to_le_bytes());
+            d.extend_from_slice(&padded);
+        }
+        d
+    }
+
+    #[test]
+    fn decodes_metadata_and_strips_metaplexs_nul_padding() {
+        // Metaplex pads each string to a fixed capacity. Comparing
+        // untrimmed would report a correctly named token as misconfigured.
+        let d = metadata_bytes("Wrapped Goldcoin", "wGLC", "https://x.invalid/a.json");
+        let m = decode_token_metadata(&d).unwrap();
+        assert_eq!(m.name, "Wrapped Goldcoin");
+        assert_eq!(m.symbol, "wGLC");
+        assert_eq!(m.uri, "https://x.invalid/a.json");
+        assert_eq!(m.update_authority, Pubkey::new_from_array([0x11; 32]));
+        assert_eq!(m.mint, Pubkey::new_from_array([0x22; 32]));
+    }
+
+    #[test]
+    fn an_empty_uri_decodes_as_empty_not_as_padding() {
+        let m = decode_token_metadata(&metadata_bytes("Wrapped Goldcoin", "wGLC", "")).unwrap();
+        assert!(m.uri.is_empty(), "got {:?}", m.uri);
+    }
+
+    #[test]
+    fn a_wrong_name_survives_decoding_so_the_caller_can_report_it() {
+        // The decoder must not normalise or "fix" anything: verification
+        // depends on seeing exactly what is on chain.
+        let m = decode_token_metadata(&metadata_bytes("Something Else", "XXX", "")).unwrap();
+        assert_eq!(m.name, "Something Else");
+        assert_eq!(m.symbol, "XXX");
+    }
+
+    #[test]
+    fn a_truncated_metadata_account_is_an_error_rather_than_panicking() {
+        let full = metadata_bytes("Wrapped Goldcoin", "wGLC", "u");
+        for cut in [0, 1, 32, 64, 70, 100] {
+            assert!(
+                decode_token_metadata(&full[..cut.min(full.len())]).is_err(),
+                "a {cut}-byte account must not decode"
+            );
+        }
+    }
 
     /// A `BridgeConfig` body as the program serialises it.
     fn bridge_config_bytes(pending: Option<Pubkey>, mint: Pubkey, cap: u64) -> Vec<u8> {

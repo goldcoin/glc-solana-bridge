@@ -102,4 +102,9 @@ pub enum BridgeError {
     WrappedSupplyCapNotLowered,
     #[msg("A governance TVL raise must propose a cap above the current one")]
     WrappedSupplyCapNotRaised,
+
+    #[msg("token metadata URI exceeds the maximum length")]
+    UriTooLong,
+    #[msg("the metadata account is not the PDA Metaplex derives for this mint")]
+    InvalidMetadataAccount,
 }
