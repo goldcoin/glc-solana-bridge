@@ -77,6 +77,7 @@ BOOTSTRAP (once, at launch -- see docs/launch-checklist.md)
                         --max-supply ATOMIC --min-deposit N --min-withdrawal N --note TEXT
   create-wrapped-mint   --mint-keypair PATH --note TEXT
   token-metadata        [--uri URL] --note TEXT     (create if absent, then verify)
+                        default uri: https://goldcoinproject.org/assets/wglc.json
   show-config
 
 ADMIN HANDOVER (custody #5)
@@ -1464,15 +1465,15 @@ async fn accept_admin(args: &[String]) -> anyhow::Result<()> {
 /// copy that could disagree.
 async fn token_metadata(args: &[String]) -> anyhow::Result<()> {
     let note = require_note(args);
-    let uri = arg(args, "--uri").unwrap_or_default();
+    // Defaults to the canonical URI so an operator cannot typo it; `--uri`
+    // overrides, and `--uri ""` deliberately writes none.
+    let uri = arg(args, "--uri").unwrap_or_else(|| ix::WRAPPED_GLC_URI.to_string());
     let chain = chain_from_env()?;
     let admin = keypair_at("GLC_ADMIN_KEYPAIR_PATH")?;
 
     let cfg = bridge_config(&chain).await?;
     if !cfg.mint_is_configured() {
-        anyhow::bail!(
-            "no wrapped mint exists yet — run `glc-admin create-wrapped-mint` first"
-        );
+        anyhow::bail!("no wrapped mint exists yet — run `glc-admin create-wrapped-mint` first");
     }
     let mint = cfg.wrapped_mint;
     let (metadata_pda, _) = ix::token_metadata_pda(&mint);
@@ -1487,12 +1488,8 @@ async fn token_metadata(args: &[String]) -> anyhow::Result<()> {
             ix::WRAPPED_GLC_SYMBOL,
             if uri.is_empty() { "(none)" } else { &uri }
         );
-        let instruction = ix::create_token_metadata_instruction(
-            &chain.program_id,
-            &admin.pubkey(),
-            &mint,
-            &uri,
-        );
+        let instruction =
+            ix::create_token_metadata_instruction(&chain.program_id, &admin.pubkey(), &mint, &uri);
         submit(&chain, &[instruction], &admin, "token-metadata", &note).await?;
     }
 
@@ -1519,7 +1516,11 @@ async fn token_metadata(args: &[String]) -> anyhow::Result<()> {
     let (mint_authority, _) = ix::mint_authority_pda(&chain.program_id);
     let mut wrong = Vec::new();
     if m.name != ix::WRAPPED_GLC_NAME {
-        wrong.push(format!("name is {:?}, expected {:?}", m.name, ix::WRAPPED_GLC_NAME));
+        wrong.push(format!(
+            "name is {:?}, expected {:?}",
+            m.name,
+            ix::WRAPPED_GLC_NAME
+        ));
     }
     if m.symbol != ix::WRAPPED_GLC_SYMBOL {
         wrong.push(format!(
@@ -1544,6 +1545,9 @@ async fn token_metadata(args: &[String]) -> anyhow::Result<()> {
         );
     }
 
-    println!("\nOK — wallets will display {} ({}), 8 decimals from the mint.", m.name, m.symbol);
+    println!(
+        "\nOK — wallets will display {} ({}), 8 decimals from the mint.",
+        m.name, m.symbol
+    );
     Ok(())
 }

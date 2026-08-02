@@ -497,6 +497,19 @@ pub const TOKEN_METADATA_PROGRAM_ID: Pubkey =
 pub const WRAPPED_GLC_NAME: &str = "Wrapped Goldcoin";
 pub const WRAPPED_GLC_SYMBOL: &str = "wGLC";
 
+/// The canonical metadata URI: hosted JSON carrying the token's `image` and
+/// display fields.
+///
+/// A **relayer constant, not a program constant** — deliberately. Name and
+/// symbol are welded into the program because they must never change and an
+/// operator must not be able to typo them. A URI is different: hosting can
+/// legitimately move, and if it were a program constant, changing it would
+/// require a program upgrade — which means exercising the single-key upgrade
+/// authority (custody #5), the largest single point of failure in the
+/// system. Keeping it here makes it the default an operator gets for free
+/// while leaving `--uri` able to override it.
+pub const WRAPPED_GLC_URI: &str = "https://goldcoinproject.org/assets/wglc.json";
+
 /// Metaplex's metadata PDA for a mint: `["metadata", program, mint]`,
 /// derived under the **Metaplex** program, not ours.
 pub fn token_metadata_pda(mint: &Pubkey) -> (Pubkey, u8) {
@@ -1038,10 +1051,37 @@ mod tests {
         assert_ne!(
             token_metadata_pda(&mint).0,
             Pubkey::find_program_address(
-                &[b"metadata", TOKEN_METADATA_PROGRAM_ID.as_ref(), mint.as_ref()],
+                &[
+                    b"metadata",
+                    TOKEN_METADATA_PROGRAM_ID.as_ref(),
+                    mint.as_ref()
+                ],
                 &ours
             )
             .0
+        );
+    }
+
+    #[test]
+    fn the_canonical_metadata_uri_is_pinned_and_is_json() {
+        // The default an operator gets without typing anything. It is a
+        // relayer constant rather than a program one so that moving the
+        // hosting never requires a program upgrade.
+        assert_eq!(
+            WRAPPED_GLC_URI,
+            "https://goldcoinproject.org/assets/wglc.json"
+        );
+        assert!(
+            WRAPPED_GLC_URI.starts_with("https://"),
+            "wallets fetch this; plain http would be downgraded or blocked"
+        );
+        assert!(
+            WRAPPED_GLC_URI.ends_with(".json"),
+            "the URI points at the metadata JSON, not directly at the image"
+        );
+        assert!(
+            WRAPPED_GLC_URI.len() <= 200,
+            "the on-chain instruction caps the URI at 200 bytes"
         );
     }
 

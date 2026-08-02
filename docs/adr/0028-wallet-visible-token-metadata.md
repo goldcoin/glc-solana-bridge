@@ -47,7 +47,7 @@ this feature is wanted at all, now is materially cheaper than later.
 | choice | why |
 |---|---|
 | **Name and symbol are program constants**, not instruction arguments | an operator cannot typo them, and what wallets will display is verifiable by reading the program rather than by trusting whoever ran the command |
-| **URI is an argument** | it points at hosted JSON for a logo, which is deployment-specific and may legitimately change. Bounded at 200 bytes so an over-long value fails with our error rather than an opaque CPI failure |
+| **URI is an argument, defaulted in the relayer** | it points at hosted JSON for a logo, which is deployment-specific and may legitimately move. Held as a **relayer** constant (`WRAPPED_GLC_URI`), not a program one: if it were welded into the program, changing it would require a program upgrade and therefore the single-key upgrade authority (custody #5). As a default it still cannot be typo'd. Bounded at 200 bytes so an over-long value fails with our error rather than an opaque CPI failure |
 | **Update authority is the mint-authority PDA** | a future change then requires this program, not whoever holds a loose keypair. Consistent with the rest of the system, where no single key changes bridge state |
 | **`is_mutable = true`** | a URI may need to move. The authority above is what makes that safe |
 | **Decimals are absent** | Metaplex metadata carries no decimals field; wallets read them from the mint, which already says 8. There is no second copy to disagree |
@@ -121,8 +121,24 @@ only*: a compromised or buggy Metaplex cannot mint, move or freeze anything —
 at worst wallets show a wrong name. That should be stated to auditors rather
 than left implicit.
 
+## 7.1 The URI is write-once, and it currently 404s
+
+Idempotence is by *existence*, not by *contents* (§4), so the URI is fixed at
+creation and there is no update instruction. That makes the hosting a
+**prerequisite**, not a follow-up.
+
+Verified 2026-08-01: the canonical
+`https://goldcoinproject.org/assets/wglc.json` and its `wglc.png` both return
+**404**. The host answers 200 at the root, so this is missing files rather
+than a wrong domain.
+
+Running `token-metadata` before those files exist writes a URI that wallets
+cannot resolve, permanently absent a program upgrade. The runbook states the
+ordering; this records why it is load-bearing rather than tidy.
+
 ## 8. What this ADR does not decide
 
-- The URI, or whether to host metadata JSON at all.
+- Who publishes the metadata JSON and image, or when.
+- Whether to add a metadata-update instruction later (none exists today).
 - Whether to make the metadata immutable later.
 - Anything about the token's listing, logo artwork, or exchange integration.

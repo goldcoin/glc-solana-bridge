@@ -571,13 +571,26 @@ one more thing to lose.
 
 **3. Give the token its wallet-visible name.**
 
+> **Host the metadata JSON first.** The URI is written once and this command
+> **does not rewrite an existing account** (§14.2). Running it before the
+> file is live bakes in a URI that 404s, and there is no update command —
+> fixing it would need a new instruction and a program upgrade.
+>
+> Verified 2026-08-01: `https://goldcoinproject.org/assets/wglc.json` and
+> `wglc.png` both return **404**. The host is up; the files are not there
+> yet. Publish them, confirm both return 200, and only then run this.
+
 ```
-glc-admin token-metadata --uri "https://<your-host>/wglc.json" --note "launch: OPS-1"
+glc-admin token-metadata --note "launch: OPS-1"
 ```
 
 Creates Metaplex metadata so wallets show **Wrapped Goldcoin (wGLC)** instead
-of a bare mint address. `--uri` is optional and points at a hosted JSON file
-carrying the logo; omit it for name and symbol only.
+of a bare mint address.
+
+The URI defaults to `https://goldcoinproject.org/assets/wglc.json`, whose
+`image` field points at `https://goldcoinproject.org/assets/wglc.png`. Pass
+`--uri <url>` to override it, or `--uri ""` for name and symbol with no
+hosted JSON.
 
 **Idempotent, and it verifies.** If the metadata already exists nothing is
 written; either way the account is read back and checked against what this
@@ -587,6 +600,17 @@ any time, not only at launch.
 
 Decimals are not set here and cannot be: Metaplex metadata carries no
 decimals field. Wallets read them from the mint, which already says 8.
+
+### 14.2 Why the URI is effectively write-once
+
+`token-metadata` is idempotent by "does metadata exist", **not** by "does it
+match what I passed". A second run with a different `--uri` leaves the
+existing account alone — deliberately, so re-running to verify can never
+silently rewrite what wallets are already displaying.
+
+The consequence is that the URI is set once, at creation. Changing it later
+requires a metadata-update instruction, which does not exist. Get the hosting
+right before the first run.
 
 **4. Verify what actually landed.**
 

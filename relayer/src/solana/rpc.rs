@@ -108,10 +108,11 @@ pub struct TokenMetadataSnapshot {
 /// correct token as misconfigured.
 pub fn decode_token_metadata(data: &[u8]) -> Result<TokenMetadataSnapshot, SolanaRpcError> {
     let need = |what: &str| SolanaRpcError::Malformed(format!("token metadata: missing {what}"));
-    let update_authority = Pubkey::try_from(data.get(1..33).ok_or_else(|| need("update authority"))?)
-        .map_err(|_| need("update authority"))?;
-    let mint =
-        Pubkey::try_from(data.get(33..65).ok_or_else(|| need("mint"))?).map_err(|_| need("mint"))?;
+    let update_authority =
+        Pubkey::try_from(data.get(1..33).ok_or_else(|| need("update authority"))?)
+            .map_err(|_| need("update authority"))?;
+    let mint = Pubkey::try_from(data.get(33..65).ok_or_else(|| need("mint"))?)
+        .map_err(|_| need("mint"))?;
 
     let mut off = 65usize;
     let mut string = |what: &'static str| -> Result<String, SolanaRpcError> {
