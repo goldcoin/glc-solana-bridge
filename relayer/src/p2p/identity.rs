@@ -42,6 +42,18 @@ pub enum IdentityError {
     DuplicatePeer(Pubkey),
     #[error("this validator's own identity {0} appears in its peer list")]
     SelfInPeerList(Pubkey),
+    #[error(
+        "this operator's own signer endpoint is not configured. Set \
+         GLC_RELAYER_LOCAL_SIGNER_URI to this operator's OWN signer-server. Without it, any \
+         payout whose designated quorum includes this operator can never reach threshold, \
+         because the relayer has no way to reach its own signer"
+    )]
+    MissingLocalSigner,
+    #[error(
+        "the local signer endpoint {uri:?} is also configured as peer {peer}'s endpoint; one \
+         address cannot serve two federation identities"
+    )]
+    DuplicateEndpoint { uri: String, peer: Pubkey },
 }
 
 /// A federation peer: the on-chain identity it must answer as, and where to
@@ -97,6 +109,55 @@ pub fn parse_peers(
     Ok(peers)
 }
 
+/// Adds this operator's **own** signer-server to the set the collector may
+/// reach.
+///
+/// # Why this is needed at all
+///
+/// `GLC_FEDERATION_PEERS` means *the other operators*, and `main` enforces
+/// that this operator is absent from it. That is correct for what the
+/// setting means, but it left the relayer with **no address for its own
+/// signer** — and a payout quorum is designated from the withdrawal index,
+/// not from who happens to be reachable, so it routinely includes this
+/// operator. The designated builder is in fact always a member of its own
+/// quorum. Every such payout collected at most `threshold - 1` partials and
+/// stalled forever.
+///
+/// The relayer still holds no vault key: its own signer is reached over the
+/// same authenticated gRPC as any other, and is subject to the same
+/// certificate pinning and on-chain identity check. The only thing that
+/// changes is that the address exists.
+///
+/// Rejects an endpoint shared with a peer: two identities answering on one
+/// address means at least one of them is not who it claims, and quorum
+/// arithmetic that counts them separately is counting a single party twice.
+pub fn with_local_signer(
+    mut peers: Vec<PeerEndpoint>,
+    own_identity: Pubkey,
+    local_uri: &str,
+) -> Result<Vec<PeerEndpoint>, IdentityError> {
+    let uri = local_uri.trim();
+    if uri.is_empty() {
+        return Err(IdentityError::MissingLocalSigner);
+    }
+    // Belt and braces: `parse_peers` already refuses self, but this function
+    // is what makes self reachable, so it re-checks rather than assuming.
+    if peers.iter().any(|p| p.validator_pubkey == own_identity) {
+        return Err(IdentityError::SelfInPeerList(own_identity));
+    }
+    if let Some(clash) = peers.iter().find(|p| p.uri == uri) {
+        return Err(IdentityError::DuplicateEndpoint {
+            uri: uri.to_string(),
+            peer: clash.validator_pubkey,
+        });
+    }
+    peers.push(PeerEndpoint {
+        validator_pubkey: own_identity,
+        uri: uri.to_string(),
+    });
+    Ok(peers)
+}
+
 /// The certificate material this validator presents and trusts.
 ///
 /// The CA is **pinned**: only certificates issued by the federation's own CA
@@ -146,6 +207,101 @@ mod tests {
 
     fn pk() -> Pubkey {
         Keypair::new().pubkey()
+    }
+
+    // -----------------------------------------------------------------
+    // The local signer endpoint
+    //
+    // Regression cover for the payout stall: a quorum is designated from the
+    // withdrawal index, so it routinely includes this operator, but
+    // `GLC_FEDERATION_PEERS` means *the others* and never contains it. With
+    // no address for its own signer the relayer collected at most
+    // `threshold - 1` partials and the withdrawal never completed.
+    // -----------------------------------------------------------------
+
+    fn peer(uri: &str) -> PeerEndpoint {
+        PeerEndpoint {
+            validator_pubkey: pk(),
+            uri: uri.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_local_signer_becomes_reachable_without_disturbing_the_peers() {
+        let me = pk();
+        let others = vec![peer("https://10.0.0.2:9000"), peer("https://10.0.0.3:9000")];
+        let all = with_local_signer(others.clone(), me, "https://127.0.0.1:9000").unwrap();
+
+        assert_eq!(all.len(), 3, "the two peers plus this operator");
+        assert_eq!(&all[..2], &others[..], "peers are untouched and in order");
+        let local = all.iter().find(|p| p.validator_pubkey == me).unwrap();
+        assert_eq!(local.uri, "https://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn a_missing_local_signer_endpoint_is_refused_rather_than_defaulted() {
+        // Failing closed at startup is the whole point: guessing an address,
+        // or carrying on without one, is how the stall shipped. The operator
+        // is told which variable to set.
+        for absent in ["", "   "] {
+            let e = with_local_signer(vec![peer("https://10.0.0.2:9000")], pk(), absent)
+                .expect_err("an unset endpoint must not be tolerated");
+            assert!(matches!(e, IdentityError::MissingLocalSigner));
+            assert!(
+                e.to_string().contains("GLC_RELAYER_LOCAL_SIGNER_URI"),
+                "the error must name the setting to fix: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_endpoint_already_claimed_by_a_peer_is_refused() {
+        // Two identities on one address means at least one is not who it
+        // says. Counting both would inflate apparent agreement.
+        let shared = "https://10.0.0.2:9000";
+        let others = vec![peer(shared)];
+        let claimed_by = others[0].validator_pubkey;
+        let e = with_local_signer(others, pk(), shared).expect_err("duplicate endpoint");
+        match e {
+            IdentityError::DuplicateEndpoint { uri, peer } => {
+                assert_eq!(uri, shared);
+                assert_eq!(peer, claimed_by);
+            }
+            other => panic!("wrong error: {other}"),
+        }
+    }
+
+    #[test]
+    fn an_operator_listed_among_its_own_peers_is_still_refused() {
+        // `parse_peers` already rejects this, but the function that makes
+        // self reachable must not be the one place the check is skipped:
+        // self appearing twice would count one operator as two.
+        let me = pk();
+        let others = vec![PeerEndpoint {
+            validator_pubkey: me,
+            uri: "https://10.0.0.2:9000".into(),
+        }];
+        assert!(matches!(
+            with_local_signer(others, me, "https://127.0.0.1:9000"),
+            Err(IdentityError::SelfInPeerList(_))
+        ));
+    }
+
+    #[test]
+    fn the_local_identity_is_the_operators_own_and_not_a_peers() {
+        // The endpoint is trusted to answer as THIS validator; the collector
+        // discards a response claiming any other identity. Binding the wrong
+        // identity here would silently defeat that check.
+        let me = pk();
+        let all = with_local_signer(
+            vec![peer("https://10.0.0.2:9000")],
+            me,
+            "https://127.0.0.1:1",
+        )
+        .unwrap();
+        let local = all.last().unwrap();
+        assert_eq!(local.validator_pubkey, me);
+        assert_ne!(local.validator_pubkey, all[0].validator_pubkey);
     }
 
     #[test]

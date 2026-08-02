@@ -60,6 +60,15 @@ impl GrpcCollector {
         }
     }
 
+    /// The endpoints this collector can reach.
+    ///
+    /// A designated signer absent from here contributes no partial, whatever
+    /// the network does — which is exactly how payouts stalled before the
+    /// local signer had an address.
+    pub fn peers(&self) -> &[PeerEndpoint] {
+        &self.peers
+    }
+
     /// Plaintext transport, for loopback and tests.
     ///
     /// Deliberately named so its use is conspicuous in review and in

@@ -361,8 +361,20 @@ fn peers_contain(raw: &str, who: &Pubkey) -> bool {
         .unwrap_or(false)
 }
 
-fn collector_from_env() -> anyhow::Result<GrpcCollector> {
-    let peers = parse_peers(&env_required("GLC_FEDERATION_PEERS")?, None)?;
+fn collector_from_env(own_identity: &Pubkey) -> anyhow::Result<GrpcCollector> {
+    // The other operators, plus this one's OWN signer-server.
+    //
+    // `GLC_FEDERATION_PEERS` deliberately excludes self, but a payout quorum
+    // is designated from the withdrawal index and therefore routinely
+    // includes this operator — always, in fact, for the payout it is
+    // designated to build. Without an address for its own signer the relayer
+    // can never reach threshold on those. See `with_local_signer`.
+    let peers = parse_peers(&env_required("GLC_FEDERATION_PEERS")?, Some(own_identity))?;
+    let peers = glc_relayer::p2p::identity::with_local_signer(
+        peers,
+        *own_identity,
+        &std::env::var("GLC_RELAYER_LOCAL_SIGNER_URI").unwrap_or_default(),
+    )?;
 
     if std::env::var("GLC_FEDERATION_TLS").as_deref() == Ok("off") {
         tracing::warn!(
@@ -553,11 +565,19 @@ async fn main() -> anyhow::Result<()> {
             solana_config.submitter_keypair_path.display()
         )
     })?;
+    // Phase 7g (ADR-0019 D1): this relayer's own federation identity, stated
+    // EXPLICITLY and never derived. It decides who acts first, and inferring
+    // it from the shape of another setting is how two configurations drift
+    // apart without anyone noticing. It is also which signer the collector
+    // must be able to reach locally, so it is read before the collector.
+    let relayer_identity: Pubkey = env_required("GLC_RELAYER_VALIDATOR_PUBKEY")?
+        .parse()
+        .map_err(|e| anyhow::anyhow!("GLC_RELAYER_VALIDATOR_PUBKEY is not a pubkey: {e}"))?;
     // Phase 7c/7d (ADR-0016): this process holds NO validator key.
     // Signatures are requested from `signer-server` peers over mutually
     // authenticated TLS, each of which independently re-derives the message
     // before signing. Only signatures cross the network.
-    let collector = collector_from_env()?;
+    let collector = collector_from_env(&relayer_identity)?;
     let solana_rpc = RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment);
     let orchestrator_poll_interval = Duration::from_millis(solana_config.poll_interval_ms);
     let orchestrator = Orchestrator::new(
@@ -591,13 +611,6 @@ async fn main() -> anyhow::Result<()> {
         &withdrawal_config.vault,
     )?;
 
-    // Phase 7g (ADR-0019 D1): this relayer's own federation identity, stated
-    // EXPLICITLY and never derived. It decides who acts first, and inferring
-    // it from the shape of another setting is how two configurations drift
-    // apart without anyone noticing.
-    let relayer_identity: Pubkey = env_required("GLC_RELAYER_VALIDATOR_PUBKEY")?
-        .parse()
-        .map_err(|e| anyhow::anyhow!("GLC_RELAYER_VALIDATOR_PUBKEY is not a pubkey: {e}"))?;
     // Fails closed both ways: we must not be listed among our own peers, and
     // we must appear in the vault signer map — that map is what gives us an
     // operator index at all.
@@ -649,7 +662,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(observed_epoch = first_epoch, "validator epoch observed");
 
     let payout_collector = FederationPayoutCollector::new(
-        collector_from_env()?,
+        collector_from_env(&relayer_identity)?,
         withdrawal_config.vault.clone(),
         vault_signer_map,
         operator_index as u32,
@@ -675,7 +688,7 @@ async fn main() -> anyhow::Result<()> {
     let completion_submitter = CompletionSubmitter::new(
         Db::open(&db_path)?,
         RealSolanaRpc::new(solana_config.rpc_url.clone(), solana_config.commitment),
-        FederationCompletionCollector::new(collector_from_env()?),
+        FederationCompletionCollector::new(collector_from_env(&relayer_identity)?),
         solana_config.program_id,
         read_keypair_file(&solana_config.submitter_keypair_path).map_err(|e| {
             anyhow::anyhow!("failed to read submitter keypair for completions: {e}")

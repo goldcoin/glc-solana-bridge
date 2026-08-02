@@ -141,6 +141,7 @@ may have fallen behind.
 | `GLC_FEDERATION_TLS` | set to `off` for loopback/regtest only; logs a warning every start |
 | `GLC_VAULT_SIGNER_MAP` | `index:base58pubkey,...` — which validator holds which vault position (Phase 7e) |
 | `GLC_RELAYER_VALIDATOR_PUBKEY` | **this** relayer's federation identity (Phase 7g) |
+| `GLC_RELAYER_LOCAL_SIGNER_URI` | **this operator's own `signer-server`.** Required — see below |
 | `GLC_PAYOUT_BUILD_TIMEOUT_SECS` | failover: seconds before a non-designated operator may build (default 120) |
 | `GLC_MINT_SUBMIT_TIMEOUT_SECS` | failover: seconds before a non-designated operator may submit a mint (default 60) |
 
@@ -160,6 +161,33 @@ another member.
 The peer list must not contain this validator's own identity, and must not
 contain duplicates. Both are rejected at startup: either would inflate
 apparent agreement by counting one party twice.
+
+### `GLC_RELAYER_LOCAL_SIGNER_URI` — this operator's own signer
+
+`GLC_FEDERATION_PEERS` means *the other operators*, so it never contains
+this one. But a payout's signing quorum is designated from the **withdrawal
+index** (ADR-0015), not from who happens to be reachable, and it contains
+exactly `threshold` members — no spares. It therefore routinely includes this
+operator; in fact the operator designated to *build* a payout is always a
+member of that payout's own quorum, because `designate_quorum` and
+`OperatorAssignment::designated_for` both start at `index mod N`.
+
+So the relayer needs an address for its **own** `signer-server`, and that is
+what this variable is. Point it at the same `GLC_SIGNER_LISTEN_ADDR` that
+operator's signer serves on, usually over loopback.
+
+**It is required, and startup fails without it.** That is deliberate: a
+relayer that cannot reach its own signer collects at most `threshold - 1`
+partials for any quorum it belongs to, so those payouts stall in `Signing`
+forever, identically on every retry. Failing closed at startup turns a silent
+permanent stall into an error message naming the variable to set.
+
+This does not put vault key material in the relayer. Its own signer is
+reached over the same authenticated gRPC as any other peer, with the same
+pinned-CA mTLS and the same on-chain identity check on every response. The
+only thing that changes is that the address exists. The endpoint may not be
+one already claimed by a peer — two identities answering on one address means
+at least one is not who it claims.
 
 > **Note:** `GLC_SOLANA_VALIDATOR_KEYPAIR_PATHS` no longer exists. The
 > relayer holds no validator key; configuring it with paths to them invited
@@ -335,6 +363,7 @@ Holds no validator key and no vault key.
 | `GLC_VAULT_SCRIPT_PUBKEY_HEX`, `GLC_VAULT_SIGNER_MAP` | yes | the vault's script and the validator-to-vault-key mapping |
 | `GLC_SOLANA_SUBMITTER_KEYPAIR_PATH` | yes | pays fees only; confers no authority |
 | `GLC_RELAYER_VALIDATOR_PUBKEY` | yes | this operator's federation identity, validated against the peer list at startup (ADR-0019 D1) |
+| `GLC_RELAYER_LOCAL_SIGNER_URI` | yes | this operator's **own** `signer-server`. Without it, every payout whose designated quorum includes this operator stalls in `Signing` forever |
 | `GLC_FEDERATION_PEERS` | yes | `base58pubkey@uri`, comma-separated; must not contain this operator |
 | `GLC_RELAYER_TLS_CERT_PATH`, `GLC_RELAYER_TLS_KEY_PATH`, `GLC_FEDERATION_TLS_DOMAIN` | yes | this process's client identity |
 | `GLC_FEDERATION_TLS` | no | `off` disables transport authentication entirely — loopback and regtest only, and loud on purpose |
