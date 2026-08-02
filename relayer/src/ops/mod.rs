@@ -25,3 +25,4 @@ pub mod indexer_status;
 pub mod metrics;
 pub mod preflight;
 pub mod solvency;
+pub mod withdraw_preflight;

@@ -684,6 +684,34 @@ completed before standing down the old key.
 
 ---
 
+## 15. Helping a user withdraw
+
+Users run `glc-wallet withdraw` themselves (`docs/withdrawal-flow.md`);
+operators do not withdraw on anyone's behalf and have no command to do so.
+
+**When a user reports a stuck withdrawal**, ask for the **withdrawal index**
+— the CLI prints it and tells them to keep it. Then:
+
+```
+glc-admin status --db "$GLC_DB_PATH"
+```
+
+and work §12 (stuck withdrawal) using that index.
+
+**If a user reports "it said it could not read the record back":** their
+withdrawal very likely succeeded. The CLI waits 30 seconds for confirmation
+and says explicitly that this is not a failure. Look the index up before
+advising anything — **never tell a user to re-run**, which would burn a
+second time.
+
+**If a user burned to an address that cannot be paid:** the tokens are gone
+and the withdrawal is unpayable. `glc-wallet` refuses such addresses before
+signing, so this should only be reachable by someone building the
+transaction by hand. There is no recovery: say so plainly rather than
+implying operators can reverse it.
+
+---
+
 ## What is deliberately absent
 
 - **Proof-of-reserves / attestation cadence** — `custody.md` #8, OPEN; no procedure exists.

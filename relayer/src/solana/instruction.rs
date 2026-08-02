@@ -588,6 +588,90 @@ pub fn update_token_metadata_instruction(
     }
 }
 
+// ---------------------------------------------------------------------------
+// burn_wrapped — the user-facing withdrawal path (glc-wallet)
+// ---------------------------------------------------------------------------
+//
+// Account order and encoding are a verbatim copy of the sequence proven end
+// to end in `tests/e2e_deposit_to_payout.rs` step 4, which burns on a real
+// validator and then finds the resulting `WithdrawalRequest` through the
+// real discovery path. That test is the reference; this is the shipped form
+// of it.
+
+pub const SEED_WITHDRAWAL: &[u8] = b"withdrawal";
+
+/// The offset of `amount` in an SPL token account.
+///
+/// `mint(32) owner(32) amount(8)`. Hand-decoded for the same reason the
+/// mint's supply is (`ops::collector`): this workspace does not depend on
+/// the SPL program crates for reading account data.
+pub const TOKEN_ACCOUNT_AMOUNT_OFFSET: usize = 64;
+
+/// Reads an SPL token account's balance.
+///
+/// `None` when the data is too short to be a token account — a caller must
+/// not treat an unreadable account as a zero balance, because "you have no
+/// tokens" and "I could not tell" lead to different advice.
+pub fn token_account_amount(data: &[u8]) -> Option<u64> {
+    let bytes = data.get(TOKEN_ACCOUNT_AMOUNT_OFFSET..TOKEN_ACCOUNT_AMOUNT_OFFSET + 8)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// A `WithdrawalRequest` PDA, keyed by the index the bridge assigns.
+///
+/// The index comes from `BridgeConfig::withdrawal_count` at submission time,
+/// so two users burning simultaneously race for it: the loser's transaction
+/// fails because the account already exists, rather than overwriting anyone.
+/// Failing is the correct outcome and the CLI says so plainly.
+pub fn withdrawal_request_pda(program_id: &Pubkey, index: u64) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[SEED_WITHDRAWAL, &index.to_le_bytes()], program_id)
+}
+
+/// The accounts `burn_wrapped` takes, in order.
+pub struct BurnWrappedAccounts {
+    /// The user: signs, pays fees, and owns the tokens being burned.
+    pub user: Pubkey,
+    pub bridge_config: Pubkey,
+    pub wrapped_mint: Pubkey,
+    pub user_token_account: Pubkey,
+    pub withdrawal: Pubkey,
+}
+
+/// Builds `burn_wrapped`.
+///
+/// `glc_address` is sent as raw bytes and the **program does not validate
+/// them** — it cannot decode base58 on chain. A malformed address therefore
+/// burns the tokens and creates a withdrawal no operator can ever pay out.
+/// Callers must validate first; `glc-wallet` does, using the very function
+/// the payout pipeline uses, so the two cannot disagree.
+pub fn burn_wrapped_instruction(
+    program_id: &Pubkey,
+    accounts: &BurnWrappedAccounts,
+    amount_atomic: u64,
+    glc_address: &str,
+) -> Instruction {
+    let mut data = Vec::with_capacity(8 + 8 + 4 + glc_address.len());
+    data.extend_from_slice(&anchor_discriminator("burn_wrapped"));
+    data.extend_from_slice(&amount_atomic.to_le_bytes());
+    // Borsh `Vec<u8>`: u32 length prefix, then the bytes.
+    data.extend_from_slice(&(glc_address.len() as u32).to_le_bytes());
+    data.extend_from_slice(glc_address.as_bytes());
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(accounts.user, true),
+            AccountMeta::new(accounts.bridge_config, false),
+            AccountMeta::new(accounts.wrapped_mint, false),
+            AccountMeta::new(accounts.user_token_account, false),
+            AccountMeta::new(accounts.withdrawal, false),
+            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+        data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,5 +1302,125 @@ mod tests {
             .find(|m| m.is_writable && m.pubkey != admin);
         let u_meta = u.accounts.iter().find(|m| m.is_writable);
         assert_eq!(c_meta.unwrap().pubkey, u_meta.unwrap().pubkey);
+    }
+
+    // --- burn_wrapped (glc-wallet) -----------------------------------------
+    //
+    // Pinned against `tests/e2e_deposit_to_payout.rs` step 4, which is the
+    // sequence proven on a real validator.
+
+    fn burn_accounts() -> BurnWrappedAccounts {
+        BurnWrappedAccounts {
+            user: Pubkey::new_unique(),
+            bridge_config: Pubkey::new_unique(),
+            wrapped_mint: Pubkey::new_unique(),
+            user_token_account: Pubkey::new_unique(),
+            withdrawal: Pubkey::new_unique(),
+        }
+    }
+
+    #[test]
+    fn burn_wrapped_is_discriminator_amount_then_a_borsh_byte_vector() {
+        let program_id = Pubkey::new_unique();
+        let a = burn_accounts();
+        let ix = burn_wrapped_instruction(&program_id, &a, 15_00000000, "mimgHRXobz");
+
+        assert_eq!(&ix.data[..8], &anchor_discriminator("burn_wrapped"));
+        assert_eq!(&ix.data[8..16], &15_00000000u64.to_le_bytes());
+        assert_eq!(&ix.data[16..20], &10u32.to_le_bytes(), "address length");
+        assert_eq!(&ix.data[20..30], b"mimgHRXobz");
+        assert_eq!(ix.data.len(), 30);
+    }
+
+    #[test]
+    fn burn_wrapped_account_order_matches_the_end_to_end_test() {
+        // Getting this order wrong fails only against a real cluster, and
+        // the failure names an account index rather than a cause.
+        let program_id = Pubkey::new_unique();
+        let a = burn_accounts();
+        let ix = burn_wrapped_instruction(&program_id, &a, 1, "m");
+        assert_eq!(
+            shape(&ix),
+            vec![
+                (a.user, true, true),
+                (a.bridge_config, false, true),
+                (a.wrapped_mint, false, true),
+                (a.user_token_account, false, true),
+                (a.withdrawal, false, true),
+                (TOKEN_PROGRAM_ID, false, false),
+                (system_program::id(), false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_user_signs_a_burn() {
+        // No bridge key is involved in a withdrawal request: the user burns
+        // their own tokens. A builder that marked anything else a signer
+        // would be asking for a signature nobody can give.
+        let program_id = Pubkey::new_unique();
+        let a = burn_accounts();
+        let ix = burn_wrapped_instruction(&program_id, &a, 1, "m");
+        let signers: Vec<_> = ix.accounts.iter().filter(|m| m.is_signer).collect();
+        assert_eq!(signers.len(), 1);
+        assert_eq!(signers[0].pubkey, a.user);
+    }
+
+    #[test]
+    fn an_address_of_every_permitted_length_encodes_exactly() {
+        // The program accepts 1..=64 bytes. A length prefix that disagreed
+        // with the payload would be rejected on chain, or worse, truncate
+        // the destination.
+        let program_id = Pubkey::new_unique();
+        let a = burn_accounts();
+        for len in [1usize, 26, 34, 64] {
+            let addr = "m".repeat(len);
+            let ix = burn_wrapped_instruction(&program_id, &a, 1, &addr);
+            assert_eq!(&ix.data[16..20], &(len as u32).to_le_bytes());
+            assert_eq!(&ix.data[20..20 + len], addr.as_bytes());
+            assert_eq!(ix.data.len(), 20 + len);
+        }
+    }
+
+    #[test]
+    fn the_withdrawal_pda_is_keyed_by_index_and_matches_discovery() {
+        // The CLI derives it from BridgeConfig::withdrawal_count; the
+        // relayer's discovery derives it independently. They must agree or a
+        // burn creates a record the pipeline never finds.
+        let program_id = Pubkey::new_unique();
+        for index in [0u64, 1, 7, u64::MAX] {
+            assert_eq!(
+                withdrawal_request_pda(&program_id, index).0,
+                crate::withdrawal::discovery::withdrawal_pda(&program_id, index).0,
+                "index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_withdrawal_indices_are_different_accounts() {
+        let program_id = Pubkey::new_unique();
+        assert_ne!(
+            withdrawal_request_pda(&program_id, 0).0,
+            withdrawal_request_pda(&program_id, 1).0
+        );
+    }
+
+    #[test]
+    fn a_token_balance_is_read_from_the_documented_offset() {
+        let mut data = vec![0u8; 165];
+        data[TOKEN_ACCOUNT_AMOUNT_OFFSET..TOKEN_ACCOUNT_AMOUNT_OFFSET + 8]
+            .copy_from_slice(&42_00000000u64.to_le_bytes());
+        assert_eq!(token_account_amount(&data), Some(42_00000000));
+    }
+
+    #[test]
+    fn an_unreadable_token_account_is_none_rather_than_zero() {
+        // "You have no tokens" and "I could not tell" lead to different
+        // advice, so they must not be the same value.
+        assert_eq!(token_account_amount(&[]), None);
+        assert_eq!(token_account_amount(&[0u8; 32]), None);
+        assert_eq!(token_account_amount(&[0u8; 71]), None);
+        assert_eq!(token_account_amount(&[0u8; 72]), Some(0));
     }
 }

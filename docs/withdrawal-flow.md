@@ -3,6 +3,62 @@
 Status: on-chain part implemented in Phase 3; payout side gated on
 custody.md.
 
+## For users: `glc-wallet withdraw`
+
+The user-facing entry point. It burns wrapped GLC and creates the
+`WithdrawalRequest` the federation pays out from.
+
+```
+glc-wallet withdraw \
+  --amount-atomic 1500000000 \
+  --glc-address <your Goldcoin address> \
+  --keypair ~/.config/solana/id.json
+```
+
+Amounts are **atomic units**: 1 GLC = 100000000, so the example above
+withdraws 15 GLC.
+
+Connection settings come from the environment, using the same names the
+bridge itself uses: `GLC_SOLANA_RPC_URL`, `GLC_SOLANA_COMMITMENT`,
+`GLC_PROGRAM_ID_HEX`. Everything else — the wrapped mint, the minimum
+withdrawal, the next withdrawal index — is read from the on-chain
+`BridgeConfig` rather than configured.
+
+### The address is checked first, and that is the point
+
+`burn_wrapped` **cannot validate the Goldcoin address**: the program has no
+base58 decoder (ADR-0018 D2), so it stores whatever bytes it is given. A
+burn with a malformed or unsupported address therefore succeeds, destroys
+the tokens, and creates a withdrawal **no operator can ever pay out** —
+there is no un-burn instruction.
+
+`glc-wallet` validates the address with `decode_p2pkh_hash160`, the very
+function the payout pipeline uses to decide whether a withdrawal is payable.
+Borrowing it rather than re-implementing the rule means the CLI can never
+accept a destination the bridge would later refuse. Every check —
+paused, minimum, balance, address — runs **before** anything is signed, and
+each refusal says "Nothing was burned".
+
+### It verifies rather than assuming
+
+After submitting, the CLI waits for the transaction to confirm, reads the
+`WithdrawalRequest` account back, and compares the amount, destination,
+requester and index against what was asked for. It prints the withdrawal
+index, the PDA, the transaction signature, the amount and the destination.
+
+If the record cannot be read within 30 seconds it says so **without**
+claiming the withdrawal failed, and tells the user to check the PDA rather
+than re-run — because re-running would burn a second time.
+
+### Concurrency
+
+The withdrawal index comes from `BridgeConfig::withdrawal_count` at
+submission time. Two users burning simultaneously race for the same index;
+the loser's transaction fails because the account already exists. Nothing is
+overwritten, and the CLI tells the loser simply to run the command again.
+
+---
+
 ## On-chain (implemented, Phase 3)
 
 `burn_wrapped(amount, glc_address)`:
