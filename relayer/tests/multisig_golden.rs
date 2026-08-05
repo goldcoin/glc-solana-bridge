@@ -336,6 +336,97 @@ fn the_assembled_scriptsig_has_the_expected_shape() {
     }
 }
 
+/// The fee estimate must cover the transaction the vault really broadcasts.
+///
+/// Regression (found in the three-operator rehearsal): the estimator charged
+/// a flat 148 bytes per input — the size of a **P2PKH** input. The vault
+/// spends 2-of-3 **P2SH multisig** outputs, which are ~299 bytes each, so
+/// every payout was sized at roughly half its true weight and paid roughly
+/// half the configured rate. A node applying that same rate rejects the
+/// result, and the payout never relays.
+///
+/// The reference transaction here was signed by goldcoind 0.17, broadcast,
+/// and mined, so "the estimate covers it" means it covers bytes that really
+/// spent — not bytes this crate also produced.
+#[test]
+fn the_fee_estimate_covers_the_transaction_the_vault_really_broadcasts() {
+    use glc_relayer::withdrawal::coin::{estimated_size_bytes, multisig_input_bytes};
+
+    let g = golden();
+    let mined = Transaction::parse_hex(&g.node_signed_hex).unwrap();
+    let real_size = mined.serialize().len() as u64;
+    let num_inputs = mined.inputs.len() as u64;
+    let num_outputs = mined.outputs.len() as u64;
+    let redeem_len = glc_relayer::glc::hex::decode_vec(&g.redeem_script_hex)
+        .unwrap()
+        .len();
+
+    let threshold = vault(&g).threshold;
+    let estimate = estimated_size_bytes(
+        num_inputs,
+        num_outputs,
+        multisig_input_bytes(threshold, redeem_len),
+    );
+    assert!(
+        estimate >= real_size,
+        "estimate {estimate} is under the {real_size} bytes goldcoind actually \
+         produced for {num_inputs} multisig input(s) — this underpays the fee"
+    );
+
+    // Over-estimating is the safe direction, but only just: the sole slack is
+    // that a real DER signature can come in a couple of bytes under the
+    // 73-byte maximum. Anything beyond that means the model has drifted.
+    let slack = estimate - real_size;
+    let max_slack = num_inputs * threshold as u64 * 3;
+    assert!(
+        slack <= max_slack,
+        "estimate {estimate} overshoots {real_size} by {slack}, more than the \
+         {max_slack} bytes of DER slack that is explainable"
+    );
+
+    // Pin the defect itself: the old P2PKH figure does not cover this.
+    const P2PKH_INPUT_BYTES: u64 = 148;
+    assert!(
+        estimated_size_bytes(num_inputs, num_outputs, P2PKH_INPUT_BYTES) < real_size,
+        "the P2PKH input size must NOT cover a multisig spend — if it does, \
+         this test has stopped guarding anything"
+    );
+}
+
+/// Whatever rate an operator configures, the fee has to buy the real bytes.
+///
+/// A node measures the transaction it receives, so the only fee that relays
+/// is one computed over the true serialized size.
+#[test]
+fn the_fee_buys_the_real_bytes_at_every_configured_rate() {
+    use glc_relayer::withdrawal::coin::{fee_for, multisig_input_bytes};
+
+    let g = golden();
+    let mined = Transaction::parse_hex(&g.node_signed_hex).unwrap();
+    let real_size = mined.serialize().len() as u64;
+    let redeem_len = glc_relayer::glc::hex::decode_vec(&g.redeem_script_hex)
+        .unwrap()
+        .len();
+    let input_bytes = multisig_input_bytes(vault(&g).threshold, redeem_len);
+
+    // 1_000 is Goldcoin 0.17's default minimum relay rate; the rest bracket
+    // what an operator would plausibly configure.
+    for rate in [1_000u64, 10_000, 100_000, 1_000_000] {
+        let demanded = real_size.saturating_mul(rate).div_ceil(1000);
+        let paid = fee_for(
+            mined.inputs.len() as u64,
+            mined.outputs.len() as u64,
+            rate,
+            input_bytes,
+        );
+        assert!(
+            paid >= demanded,
+            "at {rate}/kB the payout pays {paid} but the node demands \
+             {demanded} for its {real_size} bytes"
+        );
+    }
+}
+
 #[test]
 fn extract_signatures_rejects_a_scriptsig_with_no_signature() {
     // A partial containing only the redeem script (or nothing) is malformed;

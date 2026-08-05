@@ -364,6 +364,7 @@ async fn the_documented_compromise_response_moves_the_whole_vault() {
             cfg.fee_rate_per_kb,
             cfg.dust_threshold_atomic,
             cfg.max_inputs_per_payout,
+            glc_relayer::withdrawal::coin::multisig_input_bytes(2, 105),
         )
         .expect("the sweep plans");
         plans.push((db, plan));
@@ -551,6 +552,7 @@ async fn an_operator_whose_vault_view_differs_derives_a_different_commitment() {
             cfg.fee_rate_per_kb,
             cfg.dust_threshold_atomic,
             cfg.max_inputs_per_payout,
+            glc_relayer::withdrawal::coin::multisig_input_bytes(2, 105),
         )
         .expect("plans")
     };

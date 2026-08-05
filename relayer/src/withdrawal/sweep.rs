@@ -182,6 +182,7 @@ impl SweepDestination {
 /// Inputs are used in the order given; callers pass them in the canonical
 /// `vault_utxos` order so two operators planning the same sweep produce the
 /// same transaction.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_sweep(
     source_hash160: [u8; 20],
     dest: SweepDestination,
@@ -189,6 +190,9 @@ pub fn plan_sweep(
     fee_rate_per_kb: u64,
     dust_threshold_atomic: u64,
     max_inputs: usize,
+    // Bytes per signed vault input (`coin::multisig_input_bytes`): a sweep
+    // spends the same P2SH multisig outputs a payout does.
+    input_bytes: u64,
 ) -> Result<SweepPlan, SweepError> {
     let SweepDestination {
         hash160: dest_hash160,
@@ -213,7 +217,12 @@ pub fn plan_sweep(
     }
 
     let total: u64 = utxos.iter().map(|u| u.amount_atomic).sum();
-    let fee = fee_for(utxos.len() as u64, SWEEP_OUTPUT_COUNT, fee_rate_per_kb);
+    let fee = fee_for(
+        utxos.len() as u64,
+        SWEEP_OUTPUT_COUNT,
+        fee_rate_per_kb,
+        input_bytes,
+    );
     let swept = total
         .checked_sub(fee)
         .ok_or(SweepError::FeeExceedsValue { total, fee })?;
@@ -365,6 +374,7 @@ mod tests {
             RATE,
             DUST,
             20,
+            crate::withdrawal::coin::multisig_input_bytes(2, 105),
         )
         .expect("plan")
     }
@@ -416,6 +426,7 @@ mod tests {
             RATE,
             DUST,
             20,
+            crate::withdrawal::coin::multisig_input_bytes(2, 105),
         )
         .unwrap_err();
         assert_eq!(err, SweepError::DestinationIsSource);
@@ -430,6 +441,7 @@ mod tests {
             RATE,
             DUST,
             20,
+            crate::withdrawal::coin::multisig_input_bytes(2, 105),
         )
         .unwrap_err();
         assert_eq!(err, SweepError::NothingToSweep);
@@ -444,6 +456,7 @@ mod tests {
             RATE,
             DUST,
             20,
+            crate::withdrawal::coin::multisig_input_bytes(2, 105),
         )
         .unwrap_err();
         assert!(
@@ -462,6 +475,7 @@ mod tests {
             RATE,
             DUST,
             20,
+            crate::withdrawal::coin::multisig_input_bytes(2, 105),
         )
         .unwrap_err();
         assert!(
@@ -480,6 +494,7 @@ mod tests {
             RATE,
             DUST,
             20,
+            crate::withdrawal::coin::multisig_input_bytes(2, 105),
         )
         .unwrap_err();
         assert_eq!(

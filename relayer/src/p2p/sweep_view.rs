@@ -277,6 +277,10 @@ impl<S: PartialSigner> SweepView<S> {
             inputs.len() as u64,
             SWEEP_OUTPUT_COUNT,
             self.config.fee_rate_per_kb,
+            crate::withdrawal::coin::multisig_input_bytes(
+                self.vault.threshold,
+                self.vault.redeem_script.len(),
+            ),
         )
         .saturating_mul(MAX_SWEEP_FEE_MULTIPLE);
         if fee > ceiling {

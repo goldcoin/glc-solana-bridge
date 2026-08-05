@@ -614,6 +614,10 @@ fn build_plan(args: &[String], cfg: &WithdrawalConfig, db: &Db) -> anyhow::Resul
         cfg.fee_rate_per_kb,
         cfg.dust_threshold_atomic,
         cfg.max_inputs_per_payout,
+        glc_relayer::withdrawal::coin::multisig_input_bytes(
+            cfg.vault.threshold,
+            cfg.vault.redeem_script.len(),
+        ),
     )
     .map_err(|e| anyhow::anyhow!("cannot plan this sweep: {e}"))?;
 

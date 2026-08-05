@@ -358,6 +358,10 @@ async fn granting_a_sweep_signature_records_what_left_the_vault() {
         cfg.fee_rate_per_kb,
         cfg.dust_threshold_atomic,
         cfg.max_inputs_per_payout,
+        glc_relayer::withdrawal::coin::multisig_input_bytes(
+            vault.threshold,
+            vault.redeem_script.len(),
+        ),
     )
     .unwrap();
 

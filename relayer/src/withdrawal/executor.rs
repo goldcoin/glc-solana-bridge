@@ -300,6 +300,20 @@ impl<R: PayoutRpc, C: PayoutPartialCollector> WithdrawalExecutor<R, C> {
         &mut self.db
     }
 
+    /// Bytes one signed vault input contributes, from the vault this
+    /// executor actually spends from.
+    ///
+    /// Derived, never a constant: the size depends on the threshold and the
+    /// redeem script, and a 2-of-3 P2SH multisig input is roughly twice a
+    /// P2PKH one. Using the P2PKH figure underpaid every payout by ~39% and
+    /// nodes refused to relay them.
+    fn vault_input_bytes(&self) -> u64 {
+        coin::multisig_input_bytes(
+            self.config.vault.threshold,
+            self.config.vault.redeem_script.len(),
+        )
+    }
+
     /// Records newly discovered withdrawals. Discovery itself (the Solana
     /// `getProgramAccounts` scan at finalized commitment) is the caller's
     /// job; this is the persistence half, kept separate so the Goldcoin-side
@@ -511,6 +525,7 @@ impl<R: PayoutRpc, C: PayoutPartialCollector> WithdrawalExecutor<R, C> {
             self.config.fee_rate_per_kb,
             self.config.dust_threshold_atomic,
             self.config.max_inputs_per_payout,
+            self.vault_input_bytes(),
         ) {
             Ok(s) => s,
             Err(SelectionError::Insufficient { .. })
