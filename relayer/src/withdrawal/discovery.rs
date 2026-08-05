@@ -424,6 +424,18 @@ mod tests {
             ) -> Result<solana_sdk::signature::Signature, SolanaRpcError> {
                 unreachable!()
             }
+            async fn get_signature_status(
+                &self,
+                _: &solana_sdk::signature::Signature,
+            ) -> Result<Option<Result<(), String>>, SolanaRpcError> {
+                unreachable!()
+            }
+            async fn is_blockhash_valid(
+                &self,
+                _: &solana_sdk::hash::Hash,
+            ) -> Result<bool, SolanaRpcError> {
+                unreachable!()
+            }
             async fn get_program_accounts_sized(
                 &self,
                 _: &Pubkey,
@@ -494,6 +506,18 @@ mod tests {
                 &self,
                 _: &solana_sdk::transaction::Transaction,
             ) -> Result<solana_sdk::signature::Signature, SolanaRpcError> {
+                unreachable!()
+            }
+            async fn get_signature_status(
+                &self,
+                _: &solana_sdk::signature::Signature,
+            ) -> Result<Option<Result<(), String>>, SolanaRpcError> {
+                unreachable!()
+            }
+            async fn is_blockhash_valid(
+                &self,
+                _: &solana_sdk::hash::Hash,
+            ) -> Result<bool, SolanaRpcError> {
                 unreachable!()
             }
             async fn get_program_accounts_sized(

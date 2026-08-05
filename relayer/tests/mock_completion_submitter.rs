@@ -94,6 +94,17 @@ impl SolanaRpc for MockRpc {
         self.0.lock().unwrap().sent.push(tx.clone());
         Ok(Signature::new_unique())
     }
+    async fn get_signature_status(
+        &self,
+        _: &Signature,
+    ) -> Result<Option<Result<(), String>>, SolanaRpcError> {
+        // The completion submitter reconciles against on-chain account state,
+        // not signature status.
+        unreachable!("the completion submitter does not confirm by signature")
+    }
+    async fn is_blockhash_valid(&self, _: &solana_sdk::hash::Hash) -> Result<bool, SolanaRpcError> {
+        unreachable!("the completion submitter does not confirm by signature")
+    }
     async fn get_program_accounts_sized(
         &self,
         _: &Pubkey,

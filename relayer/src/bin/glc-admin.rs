@@ -712,6 +712,9 @@ fn sweep_revoke(args: &[String]) -> anyhow::Result<()> {
 struct Chain {
     rpc: RealSolanaRpc,
     program_id: solana_sdk::pubkey::Pubkey,
+    /// Carried so a confirmation failure can report which commitment was
+    /// actually asked for, rather than leaving an operator to infer it.
+    commitment: solana_sdk::commitment_config::CommitmentLevel,
 }
 
 fn chain_from_env() -> anyhow::Result<Chain> {
@@ -725,6 +728,7 @@ fn chain_from_env() -> anyhow::Result<Chain> {
     Ok(Chain {
         rpc: RealSolanaRpc::new(env_required("GLC_SOLANA_RPC_URL")?, commitment),
         program_id,
+        commitment,
     })
 }
 
@@ -734,7 +738,13 @@ fn keypair_at(var: &str) -> anyhow::Result<Keypair> {
         .map_err(|e| anyhow::anyhow!("could not read the keypair at {path} ({var}): {e}"))
 }
 
-/// Signs and sends one transaction, reporting the signature.
+/// Signs, sends, and **waits for** one transaction (ADR-0030).
+///
+/// Returns only once the cluster has been observed to include the
+/// transaction at the configured commitment. Submission is not inclusion:
+/// before this waited, every command here printed a signature and exited `0`
+/// whether or not the transaction ever landed — which made `glc-admin pause`
+/// indistinguishable from a pause that silently never happened.
 async fn submit(
     chain: &Chain,
     instructions: &[solana_sdk::instruction::Instruction],
@@ -742,19 +752,112 @@ async fn submit(
     what: &str,
     note: &str,
 ) -> anyhow::Result<()> {
+    submit_signed(chain, instructions, payer, &[payer], what, note).await
+}
+
+/// As [`submit`], for the one instruction that needs a second signer (the
+/// mint account signs its own creation).
+async fn submit_signed(
+    chain: &Chain,
+    instructions: &[solana_sdk::instruction::Instruction],
+    payer: &Keypair,
+    signers: &[&Keypair],
+    what: &str,
+    note: &str,
+) -> anyhow::Result<()> {
     let blockhash = chain.rpc.get_latest_blockhash().await?;
     let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
         instructions,
         Some(&payer.pubkey()),
-        &[payer],
+        signers,
         blockhash,
     );
     let sig = chain.rpc.send_transaction(&tx).await?;
-    // Logged at warn: every command that reaches here changed the bridge's
-    // behaviour on-chain, and the note is the audit record of why.
+    // Logged at warn: every command that reaches here is ATTEMPTING to change
+    // the bridge's behaviour on-chain, and the note is the audit record of
+    // why. It is deliberately logged before the outcome is known — an action
+    // that was attempted and then failed still belongs in the trail.
     tracing::warn!(action = what, signature = %sig, %note, "SUBMITTED an on-chain operator action");
-    println!("{what} submitted\n  signature: {sig}\n  note: {note}");
+    println!("{what} submitted (awaiting confirmation)\n  signature: {sig}\n  note: {note}");
+
+    confirm(chain, &sig, &blockhash, what).await?;
+    println!("{what} CONFIRMED at {:?} commitment", chain.commitment);
     Ok(())
+}
+
+/// Waits for `sig`, turning any failure into an operator-actionable error.
+///
+/// Every error names the signature, the action, the commitment that was
+/// required, and the reason — an operator reading it in an incident should
+/// not have to reconstruct which of those four it was.
+async fn confirm(
+    chain: &Chain,
+    sig: &solana_sdk::signature::Signature,
+    blockhash: &solana_sdk::hash::Hash,
+    what: &str,
+) -> anyhow::Result<()> {
+    match glc_relayer::solana::confirm::confirm_transaction(
+        &chain.rpc,
+        sig,
+        blockhash,
+        glc_relayer::solana::confirm::ConfirmPolicy::default(),
+    )
+    .await
+    {
+        Ok(()) => {
+            tracing::warn!(
+                action = what,
+                signature = %sig,
+                commitment = ?chain.commitment,
+                "CONFIRMED an on-chain operator action"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(
+                action = what,
+                signature = %sig,
+                commitment = ?chain.commitment,
+                error = %e,
+                "an on-chain operator action did NOT take effect"
+            );
+            Err(anyhow::anyhow!(
+                "{what} did NOT take effect.\n  signature:  {sig}\n  commitment: {:?}\n  \
+                 reason:     {e}\n\nThe bridge is in whatever state it was before this command. \
+                 Verify with `glc-admin show-config` before retrying.",
+                chain.commitment
+            ))
+        }
+    }
+}
+
+/// Reads an expected on-chain effect back after confirmation.
+///
+/// Confirmation proves the transaction executed; it does not prove the
+/// operator got the state they meant. Where a command has a cheap read-back,
+/// this asserts it — the launch checklist's "read every value back" made
+/// executable rather than advisory.
+async fn verify_postcondition(
+    what: &str,
+    description: &str,
+    observed: anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    match observed {
+        Ok(true) => {
+            println!("  verified: {description}");
+            Ok(())
+        }
+        Ok(false) => Err(anyhow::anyhow!(
+            "{what} confirmed on chain, but the expected result was NOT observed: {description}. \
+             This is a contradiction — the transaction succeeded yet the state does not reflect \
+             it. Do not retry blindly; inspect with `glc-admin show-config`."
+        )),
+        Err(e) => Err(anyhow::anyhow!(
+            "{what} confirmed on chain, but its result could not be read back ({description}): \
+             {e}. The action most likely took effect; confirm with `glc-admin show-config` \
+             before retrying."
+        )),
+    }
 }
 
 /// The federation as this operator's node currently sees it.
@@ -834,13 +937,20 @@ async fn set_paused(args: &[String], paused: bool) -> anyhow::Result<()> {
         );
     }
 
+    let what = if paused { "pause" } else { "unpause" };
     let instruction = ix::set_paused_instruction(&chain.program_id, &admin.pubkey(), paused);
-    submit(
-        &chain,
-        &[instruction],
-        &admin,
-        if paused { "pause" } else { "unpause" },
-        &note,
+    submit(&chain, &[instruction], &admin, what, &note).await?;
+
+    // The circuit breaker is the one setting an operator most needs to be
+    // true rather than merely submitted (runbooks §3 has them pause and then
+    // act on that belief), so it is read back rather than assumed.
+    verify_postcondition(
+        what,
+        &format!(
+            "the bridge is now {}",
+            if paused { "PAUSED" } else { "LIVE" }
+        ),
+        bridge_config(&chain).await.map(|c| c.paused == paused),
     )
     .await
 }
@@ -861,7 +971,16 @@ async fn lower_tvl_cap(args: &[String]) -> anyhow::Result<()> {
          timelocked raise (`submit-tvl-raise`)."
     );
     let instruction = ix::lower_supply_cap_instruction(&chain.program_id, &admin.pubkey(), new_max);
-    submit(&chain, &[instruction], &admin, "lower-tvl-cap", &note).await
+    submit(&chain, &[instruction], &admin, "lower-tvl-cap", &note).await?;
+
+    verify_postcondition(
+        "lower-tvl-cap",
+        &format!("the wrapped-supply cap is now {new_max} atomic"),
+        bridge_config(&chain)
+            .await
+            .map(|c| c.max_wrapped_supply == new_max),
+    )
+    .await
 }
 
 // ------------------------------------------------------- governance actions
@@ -996,6 +1115,12 @@ async fn submit_rotation(args: &[String]) -> anyhow::Result<()> {
         &note,
     )
     .await?;
+    verify_postcondition(
+        "propose-rotation",
+        "the rotation is queued on chain behind the timelock",
+        pending_action(&chain).await.map(|p| p.is_some()),
+    )
+    .await?;
     println!(
         "\nThe rotation is QUEUED behind the governance timelock. Run `glc-admin show-pending`\n\
          for its eta, then `glc-admin execute-rotation` once it has elapsed."
@@ -1023,6 +1148,12 @@ async fn submit_tvl_raise(args: &[String]) -> anyhow::Result<()> {
         &payer,
         "propose-tvl-raise",
         &note,
+    )
+    .await?;
+    verify_postcondition(
+        "propose-tvl-raise",
+        "the cap raise is queued on chain behind the timelock",
+        pending_action(&chain).await.map(|p| p.is_some()),
     )
     .await?;
     println!(
@@ -1069,6 +1200,12 @@ async fn submit_cancel(args: &[String]) -> anyhow::Result<()> {
         "cancel-governance",
         &note,
     )
+    .await?;
+    verify_postcondition(
+        "cancel-governance",
+        "the queued governance action is gone",
+        pending_action(&chain).await.map(|p| p.is_none()),
+    )
     .await
 }
 
@@ -1102,16 +1239,19 @@ async fn execute_queued(args: &[String], cap_raise: bool) -> anyhow::Result<()> 
     } else {
         ix::execute_rotation_instruction(&chain.program_id, &payer.pubkey())
     };
-    submit(
-        &chain,
-        &[instruction],
-        &payer,
-        if cap_raise {
-            "execute-tvl-raise"
-        } else {
-            "execute-rotation"
-        },
-        &note,
+    let what = if cap_raise {
+        "execute-tvl-raise"
+    } else {
+        "execute-rotation"
+    };
+    submit(&chain, &[instruction], &payer, what, &note).await?;
+
+    // Execution closes the governance action account, so "nothing pending"
+    // is the observable proof the queued action actually applied.
+    verify_postcondition(
+        what,
+        "the queued governance action is no longer pending",
+        pending_action(&chain).await.map(|p| p.is_none()),
     )
     .await
 }
@@ -1306,6 +1446,17 @@ async fn initialize(args: &[String]) -> anyhow::Result<()> {
         max_supply,
     );
     submit(&chain, &[instruction], &authority, "initialize", &note).await?;
+
+    // The bootstrap sequence's very next step reads this account. Before
+    // confirmation existed, `create-wrapped-mint` run straight afterwards
+    // reported "the bridge config account does not exist" (ADR-0030).
+    verify_postcondition(
+        "initialize",
+        "the bridge config account exists and is readable",
+        bridge_config(&chain).await.map(|_| true),
+    )
+    .await?;
+
     println!("\nNow verify what actually landed: `glc-admin show-config`");
     Ok(())
 }
@@ -1341,16 +1492,26 @@ async fn create_wrapped_mint(args: &[String]) -> anyhow::Result<()> {
 
     let instruction =
         ix::create_wrapped_mint_instruction(&chain.program_id, &admin.pubkey(), &mint.pubkey());
-    let blockhash = chain.rpc.get_latest_blockhash().await?;
-    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+    submit_signed(
+        &chain,
         &[instruction],
-        Some(&admin.pubkey()),
+        &admin,
         &[&admin, &mint],
-        blockhash,
-    );
-    let sig = chain.rpc.send_transaction(&tx).await?;
-    tracing::warn!(signature = %sig, %note, "SUBMITTED create_wrapped_mint");
-    println!("create-wrapped-mint submitted\n  signature: {sig}\n  note: {note}");
+        "create-wrapped-mint",
+        &note,
+    )
+    .await?;
+
+    let expected = mint.pubkey();
+    verify_postcondition(
+        "create-wrapped-mint",
+        &format!("the wrapped mint is {expected}"),
+        bridge_config(&chain)
+            .await
+            .map(|c| c.mint_is_configured() && c.wrapped_mint == expected),
+    )
+    .await?;
+
     println!(
         "\nThe mint keypair confers nothing from here on. Verify with `glc-admin show-config`."
     );
@@ -1428,7 +1589,16 @@ async fn transfer_admin(args: &[String]) -> anyhow::Result<()> {
     );
     let instruction =
         ix::transfer_admin_instruction(&chain.program_id, &admin.pubkey(), &new_admin);
-    submit(&chain, &[instruction], &admin, "transfer-admin", &note).await
+    submit(&chain, &[instruction], &admin, "transfer-admin", &note).await?;
+
+    verify_postcondition(
+        "transfer-admin",
+        &format!("{new_admin} is nominated and the handover is in flight"),
+        bridge_config(&chain)
+            .await
+            .map(|c| c.pending_admin == Some(new_admin)),
+    )
+    .await
 }
 
 /// `accept-admin` — step 2, signed by the INCOMING admin.
@@ -1452,7 +1622,16 @@ async fn accept_admin(args: &[String]) -> anyhow::Result<()> {
 
     println!("ACCEPTING the admin role as {}", new_admin.pubkey());
     let instruction = ix::accept_admin_instruction(&chain.program_id, &new_admin.pubkey());
-    submit(&chain, &[instruction], &new_admin, "accept-admin", &note).await
+    submit(&chain, &[instruction], &new_admin, "accept-admin", &note).await?;
+
+    verify_postcondition(
+        "accept-admin",
+        &format!("{} is now the admin", new_admin.pubkey()),
+        bridge_config(&chain)
+            .await
+            .map(|c| c.admin == new_admin.pubkey() && c.pending_admin.is_none()),
+    )
+    .await
 }
 
 /// `token-metadata` — makes the wrapped mint show up in wallets as

@@ -355,6 +355,36 @@ pub trait SolanaRpc {
         tx: &Transaction,
     ) -> impl std::future::Future<Output = Result<Signature, SolanaRpcError>> + Send;
 
+    /// What the cluster knows about `signature` at this client's commitment.
+    ///
+    /// Three outcomes, and they are deliberately distinct — collapsing any
+    /// pair of them is how an unconfirmed transaction gets reported as a
+    /// success:
+    ///
+    /// - `None` — not yet seen at this commitment. Says nothing about whether
+    ///   it ever will be; pair it with [`SolanaRpc::is_blockhash_valid`] to
+    ///   tell "still landing" from "can never land".
+    /// - `Some(Ok(()))` — confirmed at this commitment and the transaction
+    ///   succeeded.
+    /// - `Some(Err(_))` — confirmed at this commitment and the transaction
+    ///   FAILED on chain. The instruction did not take effect.
+    fn get_signature_status(
+        &self,
+        signature: &Signature,
+    ) -> impl std::future::Future<Output = Result<Option<Result<(), String>>, SolanaRpcError>> + Send;
+
+    /// Whether `blockhash` can still be used to land a transaction.
+    ///
+    /// This is what makes bounded confirmation possible without guessing: a
+    /// transaction whose blockhash has expired and which has not confirmed
+    /// can never confirm, so waiting longer is pointless. Without it the only
+    /// options are to wait forever or to wait an arbitrary interval and
+    /// assume — and assuming is the defect this exists to prevent.
+    fn is_blockhash_valid(
+        &self,
+        blockhash: &Hash,
+    ) -> impl std::future::Future<Output = Result<bool, SolanaRpcError>> + Send;
+
     /// Every account owned by `program_id` whose data is exactly `data_len`
     /// bytes, at the given commitment. Used by the Phase 6 withdrawal
     /// executor to enumerate `WithdrawalRequest` PDAs (ADR-0013).
@@ -436,6 +466,45 @@ impl SolanaRpc for RealSolanaRpc {
                     skip_preflight: false,
                     preflight_commitment: Some(self.commitment),
                     ..Default::default()
+                },
+            )
+            .await
+            .map_err(classify_client_error)
+    }
+
+    async fn get_signature_status(
+        &self,
+        signature: &Signature,
+    ) -> Result<Option<Result<(), String>>, SolanaRpcError> {
+        let statuses = self
+            .client
+            .get_signature_statuses(&[*signature])
+            .await
+            .map_err(classify_client_error)?;
+        let Some(Some(status)) = statuses.value.into_iter().next() else {
+            return Ok(None);
+        };
+        // A status row can exist before it reaches the commitment we require
+        // — `processed` shows up long before `finalized`. Treating any status
+        // row as "confirmed" would silently downgrade the caller's requested
+        // commitment, so this is checked rather than assumed.
+        if !status.satisfies_commitment(CommitmentConfig {
+            commitment: self.commitment,
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(match status.err {
+            Some(e) => Err(e.to_string()),
+            None => Ok(()),
+        }))
+    }
+
+    async fn is_blockhash_valid(&self, blockhash: &Hash) -> Result<bool, SolanaRpcError> {
+        self.client
+            .is_blockhash_valid(
+                blockhash,
+                CommitmentConfig {
+                    commitment: self.commitment,
                 },
             )
             .await

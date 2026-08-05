@@ -151,6 +151,17 @@ impl SolanaRpc for MockRpc {
             None => Ok(Signature::default()),
         }
     }
+    async fn get_signature_status(
+        &self,
+        _: &Signature,
+    ) -> Result<Option<Result<(), String>>, SolanaRpcError> {
+        // The orchestrator reconciles against on-chain account state rather
+        // than signature status, so nothing in this suite reaches here.
+        unreachable!("the mint orchestrator does not confirm by signature")
+    }
+    async fn is_blockhash_valid(&self, _: &solana_sdk::hash::Hash) -> Result<bool, SolanaRpcError> {
+        unreachable!("the mint orchestrator does not confirm by signature")
+    }
 }
 
 // ---------------------------------------------------------------------
